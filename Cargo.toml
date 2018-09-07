@@ -1,0 +1,7 @@
+[package]
+name = "spawn"
+version = "0.1.0"
+authors = ["Mathias Panzenböck <grosser.meister.morti@gmx.net>"]
+
+[dependencies]
+libc = { version = "0.2", default-features = false }
