@@ -2,17 +2,17 @@ extern crate libc;
 
 use std::vec::Vec;
 use std::result;
-use std::os::unix::io::{FromRawFd, AsRawFd};
+use std::os::unix::io::{FromRawFd, IntoRawFd, AsRawFd};
 use std::collections::HashMap;
 use std::ffi::{CStr};
 use std::fs::File;
 use std::ptr;
-use std::mem;
+use std::env;
 
 use libc::{
 	fork,
 	pipe,
-	strerror_r, // GNU
+	strerror_r, // XSI
 	perror,
 	open,
 	close,
@@ -20,7 +20,6 @@ use libc::{
 	dup2,
 	pid_t,
 	execvp,
-	execvpe, // GNU
 	mkstemp,
 	unlink,
 	exit,
@@ -38,7 +37,6 @@ use libc::{
 	EOPNOTSUPP,
 	EISDIR,
 	ENOENT,
-	EINVAL,
 	EXIT_FAILURE,
 	STDIN_FILENO,
 	STDOUT_FILENO,
@@ -52,24 +50,28 @@ pub enum Target {
 	Stderr
 }
 
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PipeSetup {
-	Keep,
+	Inherit,
 	Pipe,
 	Null,
 	Redirect(Target),
 	Temp,
-	File(c_int)
+	FileDescr(c_int),
+	File(String)
 }
 
+#[derive(Debug)]
 pub struct Pipes {
 	stdin:  PipeSetup,
 	stdout: PipeSetup,
 	stderr: PipeSetup,
+	last: Target,
 	argv: Vec<String>,
-	envp: Option<HashMap<String, String>>
+	envp: HashMap<String, String>
 }
 
+#[derive(Debug)]
 pub struct Child {
 	pid: pid_t,
 	pub stdin:  Option<File>,
@@ -77,20 +79,59 @@ pub struct Child {
 	pub stderr: Option<File>
 }
 
+#[derive(Debug)]
 pub struct Chain {
 	children: Vec<Child>
 }
 
-#[derive(Debug)]
-pub struct Error {
-	pub errno: c_int
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum Error {
+	OS(c_int),
+	NotEnoughArguments,
+	CannotRedirectStdinTo(Target),
+	NotEnoughPipes,
+	InvalidPipeLinkup
 }
 
 pub type Result<T> = result::Result<T, Error>;
 
+pub trait ToPipeSetup {
+	fn to_pipe_setup(&self) -> PipeSetup;
+}
+
+impl<'a> ToPipeSetup for &'a PipeSetup {
+	fn to_pipe_setup(&self) -> PipeSetup {
+		(*self).clone()
+	}
+}
+
+impl<'a> ToPipeSetup for &'a str {
+	fn to_pipe_setup(&self) -> PipeSetup {
+		PipeSetup::File(self.to_string())
+	}
+}
+
+impl<'a> ToPipeSetup for &'a String {
+	fn to_pipe_setup(&self) -> PipeSetup {
+		PipeSetup::File((*self).clone())
+	}
+}
+
+impl<'a> ToPipeSetup for &'a File {
+	fn to_pipe_setup(&self) -> PipeSetup {
+		PipeSetup::FileDescr(self.as_raw_fd())
+	}
+}
+
+impl ToPipeSetup for File {
+	fn to_pipe_setup(&self) -> PipeSetup {
+		PipeSetup::FileDescr(self.as_raw_fd())
+	}
+}
+
 macro_rules! c_err {
 	() => {
-		Err(Error { errno: unsafe { *__errno_location() } })
+		Err(Error::OS(unsafe { *__errno_location() }))
 	}
 }
 
@@ -121,23 +162,32 @@ impl Drop for Child {
 
 impl Error {
 	pub fn to_str(&self) -> String {
-		let mut buf = [0u8; 4096];
-		let res: c_int = unsafe {
-			strerror_r(self.errno, buf.as_mut_ptr() as *mut c_char, buf.len())
-		};
-		if res == 0 {
-			match CStr::from_bytes_with_nul(&buf[..]) {
-				Ok(errstr) => {
-					return match errstr.to_str() {
-						Ok(s) => s.to_string(),
-						_ => "error getting error string (broken UTF-8 encoding)".to_string()
+		match self {
+			Error::OS(errno) => {
+				let mut buf = [0u8; 4096];
+				let res: c_int = unsafe {
+					strerror_r(*errno, buf.as_mut_ptr() as *mut c_char, buf.len())
+				};
+				if res == 0 {
+					match CStr::from_bytes_with_nul(&buf[..]) {
+						Ok(errstr) => {
+							return match errstr.to_str() {
+								Ok(s) => s.to_string(),
+								_ => "error getting error string (broken UTF-8 encoding)".to_string()
+							}
+						},
+						_ => {}
 					}
-				},
-				_ => {}
-			}
-		}
+				}
 
-		"error getting error string".to_string()
+				"error getting error string".to_string()
+			},
+			Error::NotEnoughArguments => "not enough arguments (need at least one)".to_string(),
+			Error::CannotRedirectStdinTo(Target::Stdout) => "cannot redirect stdin to stdout".to_string(),
+			Error::CannotRedirectStdinTo(Target::Stderr) => "cannot redirect stdin to stderr".to_string(),
+			Error::NotEnoughPipes => "not enough pipes (need at least one)".to_string(),
+			Error::InvalidPipeLinkup => "invalid pipe linkup".to_string()
+		}
 	}
 }
 
@@ -150,15 +200,11 @@ macro_rules! sapwn_unexpected_token {
 }
 
 macro_rules! spawn_internal_envp {
-	() => {
-		None
-	};
-
 	($((($($key:tt)*) ($($val:tt)*)))*) => {
 		{
 			let mut envp = HashMap::new();
 			$(envp.insert($($key)*.to_string(), $($val)*.to_string());)*
-			Some(envp)
+			envp
 		}
 	}
 }
@@ -176,42 +222,33 @@ macro_rules! spawn_internal_concat {
 }
 
 macro_rules! spawn_internal {
-	(stdin ($($stream:tt)*) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($cont:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!($($cont)* (($($stream)*) ($($stdout)*) ($($stderr)*) ($($argv)*) ($($envp)*)) ($($chain)*))
+	(stdin ($($stream:tt)*) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($cont:tt)*) ($($chain:tt)*)) => {
+		spawn_internal!($($cont)* (($($stream)*) ($($stdout)*) ($($stderr)*) ($($last)*) ($($argv)*) ($($envp)*)) ($($chain)*))
 	};
 
-	(stdout ($($stream:tt)*) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($cont:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!($($cont)* (($($stdin)*) ($($stream)*) ($($stderr)*) ($($argv)*) ($($envp)*)) ($($chain)*))
+	(stdout ($($stream:tt)*) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($cont:tt)*) ($($chain:tt)*)) => {
+		spawn_internal!($($cont)* (($($stdin)*) ($($stream)*) ($($stderr)*) (Target::Stdout) ($($argv)*) ($($envp)*)) ($($chain)*))
 	};
 
-	(stdin ($($stream:tt)*) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($cont:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!($($cont)* (($($stdin)*) ($($stdout)*) ($($stream)*) ($($argv)*) ($($envp)*)) ($($chain)*))
+	(stdin ($($stream:tt)*) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($cont:tt)*) ($($chain:tt)*)) => {
+		spawn_internal!($($cont)* (($($stdin)*) ($($stdout)*) ($($stream)*) (Target::Stdin) ($($argv)*) ($($envp)*)) ($($chain)*))
 	};
 
-	(argv ($($exprs:tt)*) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($cont:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!($($cont)* (($($stdin)*) ($($stdout)*) ($($stderr)*) ($($exprst)*) ($($envp)*)) ($($chain)*))
+	(@arg ($($arg:tt)*) ($($rest:tt)*) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($chain:tt)*)) => {
+		spawn_internal!(@body () ($($rest)*) (($($stdin)*) ($($stdout)*) ($($stderr)*) ($($last)*) ($($argv)* ($($arg)*)) ($($envp)*)) ($($chain)*))
 	};
 
-	(envp ($($exprs:tt)*) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($cont:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!($($cont)* (($($stdin)*) ($($stdout)*) ($($stderr)*) ($($argv)*) ($($exprs)*)) ($($chain)*))
-	};
-
-	(arg ($($exprs:tt)*) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($cont:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!($($cont)* (($($stdin)*) ($($stdout)*) ($($stderr)*) ($($argv)* ($($exprs)*)) ($($envp)*)) ($($chain)*))
-	};
-
-	// TODO: inherit environment and only overload variables?
-	(var ($($key:tt)*) ($($val:tt)*) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($cont:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!($($cont)* (($($stdin)*) ($($stdout)*) ($($stderr)*) ($($argv)*) ($($envp)* (($($key)*) ($($val)*)))) ($($chain)*))
+	(@var ($($key:tt)*) ($($val:tt)*) ($($rest:tt)*) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($chain:tt)*)) => {
+		spawn_internal!(@head () ($($rest)*) (($($stdin)*) ($($stdout)*) ($($stderr)*) ($($last)*) ($($argv)*) ($($envp)* (($($key)*) ($($val)*)))) ($($chain)*))
 	};
 
 	// ========== ENVIRONMENT VARIABLES ========================================
-	(@env ($id:ident) ($val:expr) ($($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(var (stringify!($id)) ($val) ($($opts)*) (@head () ($($rest)*)) ($($chain)*))
+	(@env ($key:ident) ($val:expr) ($($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
+		spawn_internal!(@var (stringify!($key)) ($val) ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
-	(@env ($id:ident) ($($tt:tt)*) ($tok:tt $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@env ($id) ($($tt)* $tok) ($($rest)*) ($($opts)*) ($($chain)*))
+	(@env ($key:ident) ($($tt:tt)*) ($tok:tt $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
+		spawn_internal!(@env ($key) ($($tt)* $tok) ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	// ========== HEAD =========================================================
@@ -220,11 +257,11 @@ macro_rules! spawn_internal {
 	};
 
 	(@head ($id:ident) ($($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(arg (stringify!($id)) ($($opts)*) (@body () ($($rest)*)) ($($chain)*))
+		spawn_internal!(@arg (stringify!($id)) ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@head ($id:expr) ($($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(arg ($id) ($($opts)*) (@body () ($($rest)*)) ($($chain)*))
+		spawn_internal!(@arg ($id) ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@head () ($tok:tt $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
@@ -235,16 +272,22 @@ macro_rules! spawn_internal {
 		sapwn_unexpected_token!($tt)
 	};
 
-	// ========== BODY =========================================================
+	// ========== HELPER =======================================================
 	(@end ($($chain:tt)*)) => {
 		vec![$($chain),*]
 	};
 
-	(@body () () (($($stdout:tt)*) ($($stderr:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($chain:tt)*)) => {
+	(@chain ($($elem:tt)*) ($($chain:tt)*) ($($cont:tt)*)) => {
+		spawn_internal!($($cont)* ($($chain)* ($($elem)*)))
+	};
+
+	// ========== BODY =========================================================
+	(@body () () (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($chain:tt)*)) => {
 		spawn_internal!(@chain (Pipes {
 			stdin: $($stdin)*,
 			stdout: $($stdout)*,
 			stderr: $($stderr)*,
+			last: $($last)*,
 			argv: vec![$($argv.to_string()),*],
 			envp: spawn_internal_envp!($($envp)*)
 		}) ($($chain)*) (@end))
@@ -254,21 +297,22 @@ macro_rules! spawn_internal {
 		sapwn_unexpected_end!()
 	};
 
-	(@chain ($($elem:tt)*) ($($chain:tt)*) ($($cont:tt)*)) => {
-		spawn_internal!($($cont)* ($($chain)* ($($elem)*)))
+	(@body (|) (| $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
+		sapwn_unexpected_token!(|)
 	};
 
-	(@body (|) ($($rest:tt)*) (($($stdout:tt)*) ($($stderr:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($chain:tt)*)) => {
+	(@body (|) ($($rest:tt)+) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($chain:tt)*)) => {
 		spawn_internal!(@chain
 			(Pipes {
 				stdin: $($stdin)*,
 				stdout: $($stdout)*,
 				stderr: $($stderr)*,
+				last: $($last)*,
 				argv: vec![$($argv.to_string()),*],
 				envp: spawn_internal_envp!($($envp)*)
 			})
 			($($chain)*)
-			(@head () ($($rest)*) ((PipeSetup::Pipe) (PipeSetup::Pipe) (PipeSetup::Keep) () ()))
+			(@head () ($($rest)+) ((PipeSetup::Pipe) (PipeSetup::Pipe) (PipeSetup::Inherit) (Target::Stderr) () ()))
 		)
 	};
 
@@ -280,20 +324,20 @@ macro_rules! spawn_internal {
 		spawn_internal!(@pipe stdout () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
-	(@body (1) (> $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
+	(@body (0) (< $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
 		spawn_internal!(@pipe stdin () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
-	(@body (2) (> $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
+	(@body (1) (> $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
 		spawn_internal!(@pipe stdout () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
-	(@body (3) (> $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
+	(@body (2) (> $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
 		spawn_internal!(@pipe stderr () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body ($arg:expr) ($($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(arg ($arg) ($($opts)*) (@body () ($($rest)*)) ($($chain)*))
+		spawn_internal!(@arg ($arg) ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body ($($tt:tt)*) ($tok:tt $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
@@ -301,19 +345,24 @@ macro_rules! spawn_internal {
 	};
 
 	// ========== PIPE =========================================================
-	/* TODO
-	(@pipe $pipe:ident (&) ($($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe $pipe ???)
+	(@pipe $pipe:ident (&) (1 $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
+		spawn_internal!($pipe (PipeSetup::Redirect(Target::Stdout)) ($($opts)*) (@body () ($($rest)*)) ($($chain)*))
 	};
-	*/
+
+	(@pipe $pipe:ident (&) (2 $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
+		spawn_internal!($pipe (PipeSetup::Redirect(Target::Stderr)) ($($opts)*) (@body () ($($rest)*)) ($($chain)*))
+	};
+
+	(@pipe $pipe:ident (&) ($tok:tt $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
+		sapwn_unexpected_token!($tok:tt)
+	};
 
 	(@pipe $pipe:ident (/dev/null) ($($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
 		spawn_internal!($pipe (PipeSetup::Null) ($($opts)*) (@body () ($($rest)*)) ($($chain)*))
 	};
 
-	// TODO: needs to be much more complex in order to redirect std streams
 	(@pipe $pipe:ident ($io:expr) ($($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!($pipe ($io) ($($opts)*) (@body () ($($rest)*)) ($($chain)*))
+		spawn_internal!($pipe ($io.to_pipe_setup()) ($($opts)*) (@body () ($($rest)*)) ($($chain)*))
 	};
 
 	(@pipe $pipe:ident ($($tt:tt)*) ($tok:tt $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
@@ -323,16 +372,16 @@ macro_rules! spawn_internal {
 
 macro_rules! spawn {
 	($($tt:tt)*) => {
-		// arguments: @marker (current token) (tokens to parse) ((stdin) (stdout) (stderr) (argv) (envp)) (pipe chain array)
+		// arguments: @marker (current token) (tokens to parse) ((stdin) (stdout) (stderr) (last) (argv) (envp)) (pipe chain array)
 		{
 			let chain =
-				spawn_internal!(@head () ($($tt)*) ((PipeSetup::Keep) (PipeSetup::Pipe) (PipeSetup::Keep) () ()) ());
+				spawn_internal!(@head () ($($tt)*) ((PipeSetup::Inherit) (PipeSetup::Pipe) (PipeSetup::Inherit) (Target::Stderr) () ()) ());
 			Chain::open(&chain[..])
 		}
 	}
 }
 
-struct Fd {
+pub struct Fd {
 	fd: c_int
 }
 
@@ -399,34 +448,51 @@ fn redirect_fd(oldfd: c_int, newfd: c_int, errmsg: *const c_char) {
 	}
 }
 
+fn fd_from_setup(setup: &PipeSetup, mode: c_int) -> Fd {
+	Fd {
+		fd: match setup {
+			PipeSetup::File(ref name) => {
+				let mut bytes = name.clone().into_bytes();
+				bytes.push(0);
+				unsafe { open(name.as_ptr() as *const c_char, mode) }
+			},
+			PipeSetup::FileDescr(fd) => *fd,
+			_ => -1
+		}
+	}
+}
+
 impl Pipes {
 	pub fn new(prog: &str) -> Self {
 		Pipes {
-			stdin:  PipeSetup::Keep,
-			stdout: PipeSetup::Keep,
-			stderr: PipeSetup::Keep,
+			stdin:  PipeSetup::Inherit,
+			stdout: PipeSetup::Inherit,
+			stderr: PipeSetup::Inherit,
+			last: Target::Stderr,
 			argv: vec![prog.to_string()],
-			envp: None
+			envp: HashMap::new()
 		}
 	}
 
 	pub fn first(args: &[&str]) -> Self {
 		Pipes {
-			stdin:  PipeSetup::Keep,
+			stdin:  PipeSetup::Inherit,
 			stdout: PipeSetup::Pipe,
-			stderr: PipeSetup::Keep,
+			stderr: PipeSetup::Inherit,
+			last: Target::Stderr,
 			argv: args.iter().map(|arg| arg.to_string()).collect(),
-			envp: None
+			envp: HashMap::new()
 		}
 	}
 
 	pub fn last(args: &[&str]) -> Self {
 		Pipes {
 			stdin:  PipeSetup::Pipe,
-			stdout: PipeSetup::Keep,
-			stderr: PipeSetup::Keep,
+			stdout: PipeSetup::Inherit,
+			stderr: PipeSetup::Inherit,
+			last: Target::Stderr,
 			argv: args.iter().map(|arg| arg.to_string()).collect(),
-			envp: None
+			envp: HashMap::new()
 		}
 	}
 
@@ -434,53 +500,83 @@ impl Pipes {
 		Pipes {
 			stdin:  PipeSetup::Pipe,
 			stdout: PipeSetup::Pipe,
-			stderr: PipeSetup::Keep,
+			stderr: PipeSetup::Inherit,
+			last: Target::Stderr,
 			argv: args.iter().map(|arg| arg.to_string()).collect(),
-			envp: None
+			envp: HashMap::new()
 		}
 	}
 
 	pub fn pass_stdin(fd: c_int, args: &[&str]) -> Self {
 		Pipes {
-			stdin:  PipeSetup::File(fd),
+			stdin:  PipeSetup::FileDescr(fd),
 			stdout: PipeSetup::Pipe,
-			stderr: PipeSetup::Keep,
+			stderr: PipeSetup::Inherit,
+			last: Target::Stderr,
 			argv: args.iter().map(|arg| arg.to_string()).collect(),
-			envp: None
+			envp: HashMap::new()
 		}
 	}
 
 	pub fn pass_stdout(fd: c_int, args: &[&str]) -> Self {
 		Pipes {
 			stdin:  PipeSetup::Pipe,
-			stdout: PipeSetup::File(fd),
-			stderr: PipeSetup::Keep,
+			stdout: PipeSetup::FileDescr(fd),
+			stderr: PipeSetup::Inherit,
+			last: Target::Stderr,
 			argv: args.iter().map(|arg| arg.to_string()).collect(),
-			envp: None
+			envp: HashMap::new()
 		}
 	}
 
 	pub fn pass_stderr(fd: c_int, args: &[&str]) -> Self {
 		Pipes {
 			stdin:  PipeSetup::Pipe,
-			stdout: PipeSetup::Keep,
-			stderr: PipeSetup::File(fd),
+			stdout: PipeSetup::Inherit,
+			stderr: PipeSetup::FileDescr(fd),
+			last: Target::Stderr,
 			argv: args.iter().map(|arg| arg.to_string()).collect(),
-			envp: None
+			envp: HashMap::new()
 		}
 	}
 
+	pub fn has_output(&self) -> bool {
+		// cases in which nothing arrives at stdout:
+		// 2>&2 1>&2
+		// 1>&2 2>&1
+		// 1>&2 2>&2
+		// 1>$FILE 2>&1
+		match self.stdout {
+			PipeSetup::Pipe => {},
+			PipeSetup::FileDescr(_) | PipeSetup::File(_) => {
+				if self.last == Target::Stderr || self.stderr == PipeSetup::Inherit {
+					return false;
+				}
+			},
+			PipeSetup::Redirect(Target::Stderr) => {
+				if
+						(self.last == Target::Stderr && self.stderr == PipeSetup::Redirect(Target::Stdout)) ||
+						self.stderr == PipeSetup::Redirect(Target::Stderr) {
+					return false;
+				}
+			},
+			_ => {}
+		}
+		return true;
+	}
+
 	pub fn open(&self) -> Result<Child> {
+		// imediately consume file descriptors
+		let mut infd  = fd_from_setup(&self.stdin,  O_RDONLY);
+		let mut outfd = fd_from_setup(&self.stdout, O_WRONLY);
+		let mut errfd = fd_from_setup(&self.stderr, O_WRONLY);
+
 		if self.argv.len() == 0 {
-			return Err(Error { errno: EINVAL });
+			return Err(Error::NotEnoughArguments);
 		}
 
-		let mut infd  = Fd::new();
-		let mut outfd = Fd::new();
-		let mut errfd = Fd::new();
-
 		let stdin = match &self.stdin {
-			PipeSetup::Keep => None,
+			PipeSetup::Inherit => None,
 			PipeSetup::Pipe => {
 				let mut pair: [c_int; 2] = [-1, -1];
 				if unsafe { pipe(pair.as_mut_ptr()) } == -1 {
@@ -501,23 +597,22 @@ impl Pipes {
 				Some(unsafe { File::from_raw_fd(fd) })
 			},
 			PipeSetup::Null => {
-				infd.fd = unsafe { open(b"/dev/null\0".as_ptr() as *const i8, O_RDONLY) };
+				infd.fd = unsafe { open(b"/dev/null\0".as_ptr() as *const c_char, O_RDONLY) };
 				if infd.fd == -1 {
 					return c_err!();
 				}
 				None
 			},
-			PipeSetup::Redirect(_) => {
-				return Err(Error { errno: EINVAL });
+			PipeSetup::Redirect(target) => {
+				return Err(Error::CannotRedirectStdinTo(*target));
 			},
-			PipeSetup::File(fd) => {
-				infd.fd = *fd;
-				None
+			PipeSetup::File(_) | PipeSetup::FileDescr(_) => {
+				None // see fd_from_setup() and below after fork()
 			}
 		};
 
 		let stdout = match &self.stdout {
-			PipeSetup::Keep => None,
+			PipeSetup::Inherit => None,
 			PipeSetup::Pipe => {
 				let mut pair: [c_int; 2] = [-1, -1];
 				if unsafe { pipe(pair.as_mut_ptr()) } == -1 {
@@ -538,21 +633,19 @@ impl Pipes {
 				Some(unsafe { File::from_raw_fd(fd) })
 			},
 			PipeSetup::Null => {
-				outfd.fd = unsafe { open(b"/dev/null\0".as_ptr() as *const i8, O_WRONLY) };
+				outfd.fd = unsafe { open(b"/dev/null\0".as_ptr() as *const c_char, O_WRONLY) };
 				if outfd.fd == -1 {
 					return c_err!();
 				}
 				None
 			},
-			PipeSetup::Redirect(_) => None,
-			PipeSetup::File(fd) => {
-				outfd.fd = *fd;
-				None
+			PipeSetup::Redirect(_) | PipeSetup::File(_) | PipeSetup::FileDescr(_) => {
+				None // see fd_from_setup() and below after fork()
 			}
 		};
 
 		let stderr = match &self.stderr {
-			PipeSetup::Keep => None,
+			PipeSetup::Inherit => None,
 			PipeSetup::Pipe => {
 				let mut pair: [c_int; 2] = [-1, -1];
 				if unsafe { pipe(pair.as_mut_ptr()) } == -1 {
@@ -573,16 +666,14 @@ impl Pipes {
 				Some(unsafe { File::from_raw_fd(fd) })
 			},
 			PipeSetup::Null => {
-				errfd.fd = unsafe { open(b"/dev/null\0".as_ptr() as *const i8, O_WRONLY) };
+				errfd.fd = unsafe { open(b"/dev/null\0".as_ptr() as *const c_char, O_WRONLY) };
 				if errfd.fd == -1 {
 					return c_err!();
 				}
 				None
 			},
-			PipeSetup::Redirect(_) => None,
-			PipeSetup::File(fd) => {
-				outfd.fd = *fd;
-				None
+			PipeSetup::Redirect(_) | PipeSetup::File(_) | PipeSetup::FileDescr(_) => {
+				None // see fd_from_setup() and below after fork()
 			}
 		};
 
@@ -592,6 +683,7 @@ impl Pipes {
 			return c_err!();
 		}
 
+		// FIXME: correct linkup for various orders of redirections and stuff
 		if pid == 0 {
 			// child
 			let argv: Vec<Vec<u8>> = self.argv.iter().map(|arg| {
@@ -602,10 +694,10 @@ impl Pipes {
 			let mut c_argv: Vec<*const c_char> = argv.iter().map(|arg| arg[..].as_ptr() as *const c_char).collect();
 			c_argv.push(ptr::null());
 
-			redirect_fd(infd.fd,  STDIN_FILENO,  b"redirecting stdin\0".as_ptr() as *const c_char);
+			redirect_fd(infd.fd, STDIN_FILENO, b"redirecting stdin\0".as_ptr() as *const c_char);
 
 			if self.stdout == PipeSetup::Redirect(Target::Stderr) {
-				if unsafe { dup2(STDOUT_FILENO, STDERR_FILENO) } == -1 {
+				if unsafe { dup2(STDERR_FILENO, STDOUT_FILENO) } == -1 {
 					unsafe {
 						perror(b"redirecting stdout\0".as_ptr() as *const c_char);
 						exit(EXIT_FAILURE);
@@ -616,7 +708,7 @@ impl Pipes {
 			}
 
 			if self.stderr == PipeSetup::Redirect(Target::Stdout) {
-				if unsafe { dup2(STDERR_FILENO, STDOUT_FILENO) } == -1 {
+				if unsafe { dup2(STDOUT_FILENO, STDERR_FILENO) } == -1 {
 					unsafe {
 						perror(b"redirecting stdout\0".as_ptr() as *const c_char);
 						exit(EXIT_FAILURE);
@@ -626,29 +718,11 @@ impl Pipes {
 				redirect_fd(errfd.fd, STDERR_FILENO, b"redirecting stderr\0".as_ptr() as *const c_char);
 			}
 
-			let status = match self.envp {
-				Some(ref envp) => {
-					let envp: Vec<Vec<u8>> = envp.iter().map(|(key, val)|{
-						let mut var = String::new();
-						var.push_str(key.as_str());
-						var.push_str("=");
-						var.push_str(val.as_str());
+			for (key, val) in &self.envp {
+				env::set_var(key, val);
+			}
 
-						let mut bytes = var.into_bytes();
-						bytes.push(0);
-						bytes
-					}).collect();
-					let mut c_envp: Vec<*const c_char> = (&envp).iter().map(|var| var[..].as_ptr() as *const c_char).collect();
-					c_envp.push(ptr::null());
-
-					unsafe { execvpe(c_argv[0], c_argv.as_ptr(), c_envp.as_ptr()) }
-				},
-				None => {
-					unsafe { execvp(c_argv[0], (&c_argv[..]).as_ptr()) }
-				}
-			};
-
-			if status == -1 {
+			if unsafe { execvp(c_argv[0], (&c_argv[..]).as_ptr()) } == -1 {
 				unsafe { perror(c_argv[0]); }
 			}
 			unsafe { exit(EXIT_FAILURE); }
@@ -659,18 +733,7 @@ impl Pipes {
 	}
 
 	pub fn env(&mut self, key: &str, value: &str) {
-		match self.envp {
-			Some(ref mut envp) => {
-				envp.insert(key.to_string(), value.to_string());
-			},
-			
-			None => {
-				let mut envp = HashMap::new();
-				envp.insert(key.to_string(), value.to_string());
-				let mut envp = Some(envp);
-				mem::swap(&mut self.envp, &mut envp);
-			}
-		}
+		self.envp.insert(key.to_string(), value.to_string());
 	}
 
 	pub fn arg(&mut self, arg: &str) {
@@ -679,9 +742,7 @@ impl Pipes {
 
 	pub fn stdin(&mut self, setup: PipeSetup) {
 		match setup {
-			PipeSetup::Redirect(_) => {
-				self.stdin = PipeSetup::Keep;
-			},
+			PipeSetup::Redirect(_) => {},
 			_ => {
 				self.stdin = setup;
 			}
@@ -690,33 +751,36 @@ impl Pipes {
 
 	pub fn stdout(&mut self, setup: PipeSetup) {
 		self.stdout = setup;
+		self.last = Target::Stdout;
 	}
 
 	pub fn stderr(&mut self, setup: PipeSetup) {
 		self.stderr = setup;
+		self.last = Target::Stderr;
 	}
 }
 
 impl Chain {
 	pub fn open(pipes: &[Pipes]) -> Result<Self> {
 		if pipes.len() == 0 {
-			return Err(Error { errno: EINVAL });
+			return Err(Error::NotEnoughPipes);
 		}
-		let mut children = vec![ pipes[0].open()? ];
 
+		let mut children = vec![ pipes[0].open()? ];
 		let mut i = 1;
 		while i < pipes.len() {
 			let pipe = &pipes[i];
 
 			if pipe.stdin == PipeSetup::Pipe {
 				let stdin = match &children[i - 1].stdout {
-					Some(ref stdout) => stdout.as_raw_fd(),
-					None => return Err(Error { errno: EINVAL })
+					Some(ref stdout) => PipeSetup::FileDescr(stdout.as_raw_fd()),
+					None => PipeSetup::Null
 				};
 				children.push( Pipes {
-					stdin:  PipeSetup::File(stdin),
+					stdin:  stdin,
 					stdout: pipe.stdout.clone(),
 					stderr: pipe.stderr.clone(),
+					last: pipe.last,
 					argv: pipe.argv.clone(),
 					envp: pipe.envp.clone()
 				}.open()? );
@@ -759,35 +823,71 @@ impl Chain {
 		}
 	}
 
-	pub fn wait(&mut self) -> Result<c_int> {
-		let index = self.children.len() - 1;
-		self.children[index].wait()
+	pub fn wait(&mut self) -> Vec<Result<c_int>> {
+		self.children.iter_mut().map(|child| child.wait()).collect()
 	}
 }
 
 fn main() {
 	let var = "foo bar";
 	let word = "blubb";
-
+/*
 	let status = spawn!(
 		VAR1="egg spam" VAR2={var} echo "arg1" "arg2" {word} |
 		sed {"s/blubb/baz/"} |
-		cat
+		cat >&1
 	).expect("spawn failed").wait().expect("wait failed");
 	println!("status: {}", status);
+*/
+/*
+	let status = spawn!(
+		echo "hello world" >&1
+	).expect("spawn failed").wait();
+	println!("statuses: {:?}", status);
 
+	let status = spawn!(
+		echo "hello world 2" >&1
+	).expect("spawn failed").wait();
+	println!("statuses: {:?}", status);
+
+	let status = spawn!(
+		echo "hello world and cat" >&1 | cat >&1
+	).expect("spawn failed").wait();
+	println!("statuses: {:?}", status);
+*/
+/*
 	let file = File::open("./src/main.rs").expect("couldn't open main.rs");
-	let chain = vec![
+	let mut chain = vec![
 		Pipes::pass_stdin(file.as_raw_fd(), &["grep", "new"]),
 		Pipes::pass_through(&["cat"]),
 		Pipes::last(&["wc", "-l"])
 	];
+//	chain[0].stdin(PipeSetup::Inherit);
 	let status = Chain::open(&chain[..]).expect("chain failed").wait().expect("wait failed");
 	println!("status: {}", status);
-
+*/
 /*
 	spawn!(
 		VAR1="egg spam" VAR2={var} getenv "VAR1"
 	).expect("spawn failed");
 */
+	let status = spawn!(
+		grep "new" <"./src/main.rs" |
+		cat |
+		wc "-l" >&1
+	).expect("spawn failed").wait();
+	println!("statuses: {:?}", status);
+
+	let file = File::open("./src/main.rs").expect("couldn't open main.rs");
+	let status = spawn!(
+		grep "new" <file |
+		cat |
+		wc "-l" >&1
+	).expect("spawn failed").wait();
+	println!("statuses: {:?}", status);
+
+	let status = spawn!(
+		FOO="BAR" "./getenv" "FOO" >&1
+	).expect("spawn failed").wait();
+	println!("statuses: {:?}", status);
 }
