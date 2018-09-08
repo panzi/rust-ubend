@@ -2,7 +2,7 @@ extern crate libc;
 
 use std::vec::Vec;
 use std::result;
-use std::os::unix::io::{FromRawFd, IntoRawFd, AsRawFd};
+use std::os::unix::io::{FromRawFd, AsRawFd};
 use std::collections::HashMap;
 use std::ffi::{CStr};
 use std::fs::File;
@@ -30,8 +30,9 @@ use libc::{
 	__errno_location,
 	O_RDONLY,
 	O_WRONLY,
+	O_APPEND,
+	O_CREAT,
 	O_RDWR,
-	O_TMPFILE, // Linux
 	S_IRUSR,
 	S_IWUSR,
 	EOPNOTSUPP,
@@ -50,6 +51,13 @@ pub enum Target {
 	Stderr
 }
 
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum Mode {
+	Read,
+	Write,
+	Append
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PipeSetup {
 	Inherit,
@@ -58,7 +66,23 @@ pub enum PipeSetup {
 	Redirect(Target),
 	Temp,
 	FileDescr(c_int),
-	File(String)
+	File(String, Mode)
+}
+
+impl PipeSetup {
+	pub fn is_redirect(&self) -> bool {
+		match self {
+			PipeSetup::Redirect(_) => true,
+			_ => false
+		}
+	}
+
+	pub fn is_redirect_to(&self, target: Target) -> bool {
+		match self {
+			PipeSetup::Redirect(actual) => target == *actual,
+			_ => false
+		}
+	}
 }
 
 #[derive(Debug)]
@@ -96,35 +120,47 @@ pub enum Error {
 pub type Result<T> = result::Result<T, Error>;
 
 pub trait ToPipeSetup {
-	fn to_pipe_setup(&self) -> PipeSetup;
+	fn to_pipe_setup(&self, mode: Mode) -> PipeSetup;
+}
+
+impl ToPipeSetup for PipeSetup {
+	fn to_pipe_setup(&self, mode: Mode) -> PipeSetup {
+		match self {
+			PipeSetup::File(file, _) => PipeSetup::File(file.clone(), mode),
+			_ => self.clone()
+		}
+	}
 }
 
 impl<'a> ToPipeSetup for &'a PipeSetup {
-	fn to_pipe_setup(&self) -> PipeSetup {
-		(*self).clone()
+	fn to_pipe_setup(&self, mode: Mode) -> PipeSetup {
+		match self {
+			PipeSetup::File(file, _) => PipeSetup::File((*file).clone(), mode),
+			_ => (*self).clone()
+		}
 	}
 }
 
 impl<'a> ToPipeSetup for &'a str {
-	fn to_pipe_setup(&self) -> PipeSetup {
-		PipeSetup::File(self.to_string())
+	fn to_pipe_setup(&self, mode: Mode) -> PipeSetup {
+		PipeSetup::File(self.to_string(), mode)
 	}
 }
 
 impl<'a> ToPipeSetup for &'a String {
-	fn to_pipe_setup(&self) -> PipeSetup {
-		PipeSetup::File((*self).clone())
+	fn to_pipe_setup(&self, mode: Mode) -> PipeSetup {
+		PipeSetup::File((*self).clone(), mode)
 	}
 }
 
 impl<'a> ToPipeSetup for &'a File {
-	fn to_pipe_setup(&self) -> PipeSetup {
+	fn to_pipe_setup(&self, _mode: Mode) -> PipeSetup {
 		PipeSetup::FileDescr(self.as_raw_fd())
 	}
 }
 
 impl ToPipeSetup for File {
-	fn to_pipe_setup(&self) -> PipeSetup {
+	fn to_pipe_setup(&self, _mode: Mode) -> PipeSetup {
 		PipeSetup::FileDescr(self.as_raw_fd())
 	}
 }
@@ -199,6 +235,10 @@ macro_rules! sapwn_unexpected_token {
 	() => {}
 }
 
+macro_rules! sapwn_illegal_mode {
+	() => {}
+}
+
 macro_rules! spawn_internal_envp {
 	($((($($key:tt)*) ($($val:tt)*)))*) => {
 		{
@@ -207,18 +247,6 @@ macro_rules! spawn_internal_envp {
 			envp
 		}
 	}
-}
-
-macro_rules! spawn_internal_pass {
-	($($a:tt)*) => (
-		$($a)*
-	);
-}
-
-macro_rules! spawn_internal_concat {
-	($($a:tt)*) => (
-		$($a),*
-	);
 }
 
 macro_rules! spawn_internal {
@@ -317,23 +345,35 @@ macro_rules! spawn_internal {
 	};
 
 	(@body (<) ($($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe stdin () ($($rest)*) ($($opts)*) ($($chain)*))
-	};
-
-	(@body (>) ($($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe stdout () ($($rest)*) ($($opts)*) ($($chain)*))
+		spawn_internal!(@pipe stdin (Mode::Read) () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body (0) (< $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe stdin () ($($rest)*) ($($opts)*) ($($chain)*))
+		spawn_internal!(@pipe stdin (Mode::Read) () ($($rest)*) ($($opts)*) ($($chain)*))
+	};
+
+	(@body () (>> $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
+		spawn_internal!(@pipe stdout (Mode::Append) () ($($rest)*) ($($opts)*) ($($chain)*))
+	};
+
+	(@body (1) (>> $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
+		spawn_internal!(@pipe stdout (Mode::Append) () ($($rest)*) ($($opts)*) ($($chain)*))
+	};
+
+	(@body (2) (>> $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
+		spawn_internal!(@pipe stderr (Mode::Append) () ($($rest)*) ($($opts)*) ($($chain)*))
+	};
+
+	(@body () (> $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
+		spawn_internal!(@pipe stdout (Mode::Write) () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body (1) (> $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe stdout () ($($rest)*) ($($opts)*) ($($chain)*))
+		spawn_internal!(@pipe stdout (Mode::Write) () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body (2) (> $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe stderr () ($($rest)*) ($($opts)*) ($($chain)*))
+		spawn_internal!(@pipe stderr (Mode::Write) () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body ($arg:expr) ($($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
@@ -345,28 +385,36 @@ macro_rules! spawn_internal {
 	};
 
 	// ========== PIPE =========================================================
-	(@pipe $pipe:ident (&) (1 $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
+	(@pipe $pipe:ident (Mode::Write) (&) (1 $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
 		spawn_internal!($pipe (PipeSetup::Redirect(Target::Stdout)) ($($opts)*) (@body () ($($rest)*)) ($($chain)*))
 	};
 
-	(@pipe $pipe:ident (&) (2 $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
+	(@pipe $pipe:ident (Mode::Write) (&) (2 $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
 		spawn_internal!($pipe (PipeSetup::Redirect(Target::Stderr)) ($($opts)*) (@body () ($($rest)*)) ($($chain)*))
 	};
 
-	(@pipe $pipe:ident (&) ($tok:tt $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		sapwn_unexpected_token!($tok:tt)
+	(@pipe $pipe:ident (Mode::Write) (&) ($tok:tt $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
+		sapwn_unexpected_token!($tok)
 	};
 
-	(@pipe $pipe:ident (/dev/null) ($($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!($pipe (PipeSetup::Null) ($($opts)*) (@body () ($($rest)*)) ($($chain)*))
+	(@pipe $pipe:ident ($($mode:tt)*) (&) ($tok:tt $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
+		sapwn_illegal_mode!($mode)
 	};
 
-	(@pipe $pipe:ident ($io:expr) ($($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!($pipe ($io.to_pipe_setup()) ($($opts)*) (@body () ($($rest)*)) ($($chain)*))
+	(@pipe $pipe:ident ($($mode:tt)*) ($($tt:tt)*) (:: $tok:tt $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
+		spawn_internal!(@pipe $pipe ($($mode)*) ($($tt)* :: $tok) ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
-	(@pipe $pipe:ident ($($tt:tt)*) ($tok:tt $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe $pipe ($($tt)* $tok) ($($rest)*) ($($opts)*) ($($chain)*))
+	(@pipe $pipe:ident ($($mode:tt)*) ($($tt:tt)*) (. $tok:tt $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
+		spawn_internal!(@pipe $pipe ($($mode)*) ($($tt)* . $tok) ($($rest)*) ($($opts)*) ($($chain)*))
+	};
+
+	(@pipe $pipe:ident ($($mode:tt)*) ($io:expr) ($($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
+		spawn_internal!($pipe ($io.to_pipe_setup($($mode)*)) ($($opts)*) (@body () ($($rest)*)) ($($chain)*))
+	};
+
+	(@pipe $pipe:ident ($($mode:tt)*) ($($tt:tt)*) ($tok:tt $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
+		spawn_internal!(@pipe $pipe ($($mode)*) ($($tt)* $tok) ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 }
 
@@ -378,6 +426,12 @@ macro_rules! spawn {
 				spawn_internal!(@head () ($($tt)*) ((PipeSetup::Inherit) (PipeSetup::Pipe) (PipeSetup::Inherit) (Target::Stderr) () ()) ());
 			Chain::open(&chain[..])
 		}
+	}
+}
+
+macro_rules! cstr {
+	($str:expr) => {
+		($str).as_ptr() as *const c_char
 	}
 }
 
@@ -411,7 +465,7 @@ fn open_temp_fd_fallback() -> c_int {
 		return -1;
 	}
 
-	if unsafe { unlink(name.as_ptr() as *const c_char) } != 0 {
+	if unsafe { unlink(cstr!(name)) } != 0 {
 		unsafe { close(fd); }
 		return -1;
 	}
@@ -420,7 +474,7 @@ fn open_temp_fd_fallback() -> c_int {
 
 fn open_temp_fd() -> c_int {
 	if cfg!(target_os = "linux") {
-		let fd = unsafe { open(b"/tmp\0".as_ptr() as *const c_char, O_TMPFILE | O_RDWR, S_IRUSR | S_IWUSR) };
+		let fd = unsafe { open(cstr!(b"/tmp\0"), libc::O_TMPFILE | O_RDWR, S_IRUSR | S_IWUSR) };
 		if fd < 0 {
 			let errno = unsafe { *__errno_location() };
 			match errno {
@@ -448,13 +502,18 @@ fn redirect_fd(oldfd: c_int, newfd: c_int, errmsg: *const c_char) {
 	}
 }
 
-fn fd_from_setup(setup: &PipeSetup, mode: c_int) -> Fd {
+fn fd_from_setup(setup: &PipeSetup) -> Fd {
 	Fd {
 		fd: match setup {
-			PipeSetup::File(ref name) => {
+			PipeSetup::File(ref name, mode) => {
+				let flags = O_CREAT | match mode {
+					Mode::Read   => O_RDONLY,
+					Mode::Write  => O_WRONLY,
+					Mode::Append => O_APPEND,
+				};
 				let mut bytes = name.clone().into_bytes();
 				bytes.push(0);
-				unsafe { open(name.as_ptr() as *const c_char, mode) }
+				unsafe { open(cstr!(name), flags) }
 			},
 			PipeSetup::FileDescr(fd) => *fd,
 			_ => -1
@@ -548,7 +607,7 @@ impl Pipes {
 		// 1>$FILE 2>&1
 		match self.stdout {
 			PipeSetup::Pipe => {},
-			PipeSetup::FileDescr(_) | PipeSetup::File(_) => {
+			PipeSetup::FileDescr(_) | PipeSetup::File(_, _) => {
 				if self.last == Target::Stderr || self.stderr == PipeSetup::Inherit {
 					return false;
 				}
@@ -565,11 +624,37 @@ impl Pipes {
 		return true;
 	}
 
+	fn redirect_stdout(&self, fd: c_int) {
+		if self.stdout == PipeSetup::Redirect(Target::Stderr) {
+			if unsafe { dup2(STDERR_FILENO, STDOUT_FILENO) } == -1 {
+				unsafe {
+					perror(cstr!(b"redirecting stdout\0"));
+					exit(EXIT_FAILURE);
+				}
+			}
+		} else {
+			redirect_fd(fd, STDOUT_FILENO, cstr!(b"redirecting stdout\0"));
+		}
+	}
+
+	fn redirect_stderr(&self, fd: c_int) {
+		if self.stderr == PipeSetup::Redirect(Target::Stdout) {
+			if unsafe { dup2(STDOUT_FILENO, STDERR_FILENO) } == -1 {
+				unsafe {
+					perror(cstr!(b"redirecting stdout\0"));
+					exit(EXIT_FAILURE);
+				}
+			}
+		} else {
+			redirect_fd(fd, STDERR_FILENO, cstr!(b"redirecting stderr\0"));
+		}
+	}
+
 	pub fn open(&self) -> Result<Child> {
 		// imediately consume file descriptors
-		let mut infd  = fd_from_setup(&self.stdin,  O_RDONLY);
-		let mut outfd = fd_from_setup(&self.stdout, O_WRONLY);
-		let mut errfd = fd_from_setup(&self.stderr, O_WRONLY);
+		let mut infd  = fd_from_setup(&self.stdin);
+		let mut outfd = fd_from_setup(&self.stdout);
+		let mut errfd = fd_from_setup(&self.stderr);
 
 		if self.argv.len() == 0 {
 			return Err(Error::NotEnoughArguments);
@@ -597,7 +682,7 @@ impl Pipes {
 				Some(unsafe { File::from_raw_fd(fd) })
 			},
 			PipeSetup::Null => {
-				infd.fd = unsafe { open(b"/dev/null\0".as_ptr() as *const c_char, O_RDONLY) };
+				infd.fd = unsafe { open(cstr!(b"/dev/null\0"), O_RDONLY) };
 				if infd.fd == -1 {
 					return c_err!();
 				}
@@ -606,14 +691,14 @@ impl Pipes {
 			PipeSetup::Redirect(target) => {
 				return Err(Error::CannotRedirectStdinTo(*target));
 			},
-			PipeSetup::File(_) | PipeSetup::FileDescr(_) => {
+			PipeSetup::File(_, _) | PipeSetup::FileDescr(_) => {
 				None // see fd_from_setup() and below after fork()
 			}
 		};
 
 		let stdout = match &self.stdout {
 			PipeSetup::Inherit => None,
-			PipeSetup::Pipe => {
+			PipeSetup::Pipe | PipeSetup::Redirect(Target::Stdout) => {
 				let mut pair: [c_int; 2] = [-1, -1];
 				if unsafe { pipe(pair.as_mut_ptr()) } == -1 {
 					return c_err!();
@@ -633,19 +718,19 @@ impl Pipes {
 				Some(unsafe { File::from_raw_fd(fd) })
 			},
 			PipeSetup::Null => {
-				outfd.fd = unsafe { open(b"/dev/null\0".as_ptr() as *const c_char, O_WRONLY) };
+				outfd.fd = unsafe { open(cstr!(b"/dev/null\0"), O_WRONLY) };
 				if outfd.fd == -1 {
 					return c_err!();
 				}
 				None
 			},
-			PipeSetup::Redirect(_) | PipeSetup::File(_) | PipeSetup::FileDescr(_) => {
+			PipeSetup::Redirect(Target::Stderr) | PipeSetup::File(_, _) | PipeSetup::FileDescr(_) => {
 				None // see fd_from_setup() and below after fork()
 			}
 		};
 
 		let stderr = match &self.stderr {
-			PipeSetup::Inherit => None,
+			PipeSetup::Inherit | PipeSetup::Redirect(Target::Stderr) => None,
 			PipeSetup::Pipe => {
 				let mut pair: [c_int; 2] = [-1, -1];
 				if unsafe { pipe(pair.as_mut_ptr()) } == -1 {
@@ -666,13 +751,13 @@ impl Pipes {
 				Some(unsafe { File::from_raw_fd(fd) })
 			},
 			PipeSetup::Null => {
-				errfd.fd = unsafe { open(b"/dev/null\0".as_ptr() as *const c_char, O_WRONLY) };
+				errfd.fd = unsafe { open(cstr!(b"/dev/null\0"), O_WRONLY) };
 				if errfd.fd == -1 {
 					return c_err!();
 				}
 				None
 			},
-			PipeSetup::Redirect(_) | PipeSetup::File(_) | PipeSetup::FileDescr(_) => {
+			PipeSetup::Redirect(Target::Stdout) | PipeSetup::File(_, _) | PipeSetup::FileDescr(_) => {
 				None // see fd_from_setup() and below after fork()
 			}
 		};
@@ -691,31 +776,17 @@ impl Pipes {
 				bytes.push(0);
 				bytes
 			}).collect();
-			let mut c_argv: Vec<*const c_char> = argv.iter().map(|arg| arg[..].as_ptr() as *const c_char).collect();
+			let mut c_argv: Vec<*const c_char> = argv.iter().map(|arg| cstr!(arg[..])).collect();
 			c_argv.push(ptr::null());
 
-			redirect_fd(infd.fd, STDIN_FILENO, b"redirecting stdin\0".as_ptr() as *const c_char);
+			redirect_fd(infd.fd, STDIN_FILENO, cstr!(b"redirecting stdin\0"));
 
-			if self.stdout == PipeSetup::Redirect(Target::Stderr) {
-				if unsafe { dup2(STDERR_FILENO, STDOUT_FILENO) } == -1 {
-					unsafe {
-						perror(b"redirecting stdout\0".as_ptr() as *const c_char);
-						exit(EXIT_FAILURE);
-					}
-				}
+			if self.last == Target::Stderr {
+				self.redirect_stdout(outfd.fd);
+				self.redirect_stderr(errfd.fd);
 			} else {
-				redirect_fd(outfd.fd, STDOUT_FILENO, b"redirecting stdout\0".as_ptr() as *const c_char);
-			}
-
-			if self.stderr == PipeSetup::Redirect(Target::Stdout) {
-				if unsafe { dup2(STDOUT_FILENO, STDERR_FILENO) } == -1 {
-					unsafe {
-						perror(b"redirecting stdout\0".as_ptr() as *const c_char);
-						exit(EXIT_FAILURE);
-					}
-				}
-			} else {
-				redirect_fd(errfd.fd, STDERR_FILENO, b"redirecting stderr\0".as_ptr() as *const c_char);
+				self.redirect_stderr(errfd.fd);
+				self.redirect_stdout(outfd.fd);
 			}
 
 			for (key, val) in &self.envp {
@@ -762,13 +833,15 @@ impl Pipes {
 
 impl Chain {
 	pub fn open(pipes: &[Pipes]) -> Result<Self> {
-		if pipes.len() == 0 {
+		let len = pipes.len();
+		if len == 0 {
 			return Err(Error::NotEnoughPipes);
 		}
 
-		let mut children = vec![ pipes[0].open()? ];
+		let mut children = Vec::with_capacity(len);
+		children.push( pipes[0].open()? );
 		let mut i = 1;
-		while i < pipes.len() {
+		while i < len {
 			let pipe = &pipes[i];
 
 			if pipe.stdin == PipeSetup::Pipe {
@@ -835,23 +908,23 @@ fn main() {
 	let status = spawn!(
 		VAR1="egg spam" VAR2={var} echo "arg1" "arg2" {word} |
 		sed {"s/blubb/baz/"} |
-		cat >&1
+		cat >PipeSetup::Inherit
 	).expect("spawn failed").wait().expect("wait failed");
 	println!("status: {}", status);
 */
 /*
 	let status = spawn!(
-		echo "hello world" >&1
+		echo "hello world" >PipeSetup::Inherit
 	).expect("spawn failed").wait();
 	println!("statuses: {:?}", status);
 
 	let status = spawn!(
-		echo "hello world 2" >&1
+		echo "hello world 2" >PipeSetup::Inherit
 	).expect("spawn failed").wait();
 	println!("statuses: {:?}", status);
 
 	let status = spawn!(
-		echo "hello world and cat" >&1 | cat >&1
+		echo "hello world and cat" >&1 | cat >PipeSetup::Inherit
 	).expect("spawn failed").wait();
 	println!("statuses: {:?}", status);
 */
@@ -873,8 +946,8 @@ fn main() {
 */
 	let status = spawn!(
 		grep "new" <"./src/main.rs" |
-		cat |
-		wc "-l" >&1
+		cat >&1 |
+		wc "-l" >PipeSetup::Inherit
 	).expect("spawn failed").wait();
 	println!("statuses: {:?}", status);
 
@@ -882,12 +955,12 @@ fn main() {
 	let status = spawn!(
 		grep "new" <file |
 		cat |
-		wc "-l" >&1
+		wc "-l" >PipeSetup::Inherit
 	).expect("spawn failed").wait();
 	println!("statuses: {:?}", status);
 
 	let status = spawn!(
-		FOO="BAR" "./getenv" "FOO" >&1
+		FOO="BAR" "./getenv" "FOO" >PipeSetup::Inherit
 	).expect("spawn failed").wait();
 	println!("statuses: {:?}", status);
 }
