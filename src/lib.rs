@@ -91,17 +91,17 @@ impl PipeSetup {
 
 #[derive(Debug)]
 pub struct Pipes {
-	stdin:  PipeSetup,
-	stdout: PipeSetup,
-	stderr: PipeSetup,
-	last: Target,
-	argv: Vec<String>,
-	envp: HashMap<String, String>
+	pub stdin:  PipeSetup,
+	pub stdout: PipeSetup,
+	pub stderr: PipeSetup,
+	pub last: Target,
+	pub argv: Vec<String>,
+	pub envp: HashMap<String, String>
 }
 
 #[derive(Debug)]
 pub struct Child {
-	pid: pid_t,
+	pub pid: pid_t,
 	pub stdin:  Option<File>,
 	pub stdout: Option<File>,
 	pub stderr: Option<File>
@@ -127,8 +127,8 @@ pub trait ToPipeSetup {
 	fn to_pipe_setup(&self, mode: Mode) -> PipeSetup;
 }
 
-impl ToPipeSetup for PipeSetup {
-	fn to_pipe_setup(&self, mode: Mode) -> PipeSetup {
+impl PipeSetup {
+	pub fn to_pipe_setup(&self, mode: Mode) -> PipeSetup {
 		match self {
 			PipeSetup::File(file, _) => PipeSetup::File(file.clone(), mode),
 			_ => self.clone()
@@ -136,12 +136,15 @@ impl ToPipeSetup for PipeSetup {
 	}
 }
 
+impl ToPipeSetup for PipeSetup {
+	fn to_pipe_setup(&self, mode: Mode) -> PipeSetup {
+		(*self).to_pipe_setup(mode)
+	}
+}
+
 impl<'a> ToPipeSetup for &'a PipeSetup {
 	fn to_pipe_setup(&self, mode: Mode) -> PipeSetup {
-		match self {
-			PipeSetup::File(file, _) => PipeSetup::File((*file).clone(), mode),
-			_ => (*self).clone()
-		}
+		(*self).to_pipe_setup(mode)
 	}
 }
 
@@ -284,7 +287,7 @@ macro_rules! sapwn_illegal_mode {
 macro_rules! spawn_internal_envp {
 	($((($($key:tt)*) ($($val:tt)*)))*) => {
 		{
-			let mut envp = HashMap::new();
+			let mut envp = std::collections::HashMap::new();
 			$(envp.insert($($key)*.to_string(), $($val)*.to_string());)*
 			envp
 		}
@@ -299,11 +302,11 @@ macro_rules! spawn_internal {
 	};
 
 	(stdout ($($stream:tt)*) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($cont:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!($($cont)* (($($stdin)*) ($($stream)*) ($($stderr)*) (Target::Stdout) ($($argv)*) ($($envp)*)) ($($chain)*))
+		spawn_internal!($($cont)* (($($stdin)*) ($($stream)*) ($($stderr)*) (pipes::Target::Stdout) ($($argv)*) ($($envp)*)) ($($chain)*))
 	};
 
-	(stdin ($($stream:tt)*) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($cont:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!($($cont)* (($($stdin)*) ($($stdout)*) ($($stream)*) (Target::Stdin) ($($argv)*) ($($envp)*)) ($($chain)*))
+	(stderr ($($stream:tt)*) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($cont:tt)*) ($($chain:tt)*)) => {
+		spawn_internal!($($cont)* (($($stdin)*) ($($stdout)*) ($($stream)*) (pipes::Target::Stderr) ($($argv)*) ($($envp)*)) ($($chain)*))
 	};
 
 	(@arg ($($arg:tt)*) ($($rest:tt)*) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($chain:tt)*)) => {
@@ -355,7 +358,7 @@ macro_rules! spawn_internal {
 
 	// ========== BODY =========================================================
 	(@body () () (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($chain:tt)*)) => {
-		spawn_internal!(@chain (Pipes {
+		spawn_internal!(@chain (pipes::Pipes {
 			stdin: $($stdin)*,
 			stdout: $($stdout)*,
 			stderr: $($stderr)*,
@@ -375,7 +378,7 @@ macro_rules! spawn_internal {
 
 	(@body (|) ($($rest:tt)+) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($chain:tt)*)) => {
 		spawn_internal!(@chain
-			(Pipes {
+			(pipes::Pipes {
 				stdin: $($stdin)*,
 				stdout: $($stdout)*,
 				stderr: $($stderr)*,
@@ -384,40 +387,40 @@ macro_rules! spawn_internal {
 				envp: spawn_internal_envp!($($envp)*)
 			})
 			($($chain)*)
-			(@head () ($($rest)+) ((PipeSetup::Pipe) (PipeSetup::Pipe) (PipeSetup::Inherit) (Target::Stderr) () ()))
+			(@head () ($($rest)+) ((pipes::PipeSetup::Pipe) (pipes::PipeSetup::Pipe) (pipes::PipeSetup::Inherit) (pipes::Target::Stderr) () ()))
 		)
 	};
 
 	(@body (<) ($($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe stdin (Mode::Read) () ($($rest)*) ($($opts)*) ($($chain)*))
+		spawn_internal!(@pipe stdin (pipes::Mode::Read) () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body (0) (< $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe stdin (Mode::Read) () ($($rest)*) ($($opts)*) ($($chain)*))
+		spawn_internal!(@pipe stdin (pipes::Mode::Read) () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body () (>> $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe stdout (Mode::Append) () ($($rest)*) ($($opts)*) ($($chain)*))
+		spawn_internal!(@pipe stdout (pipes::Mode::Append) () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body (1) (>> $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe stdout (Mode::Append) () ($($rest)*) ($($opts)*) ($($chain)*))
+		spawn_internal!(@pipe stdout (pipes::Mode::Append) () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body (2) (>> $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe stderr (Mode::Append) () ($($rest)*) ($($opts)*) ($($chain)*))
+		spawn_internal!(@pipe stderr (pipes::Mode::Append) () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body () (> $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe stdout (Mode::Write) () ($($rest)*) ($($opts)*) ($($chain)*))
+		spawn_internal!(@pipe stdout (pipes::Mode::Write) () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body (1) (> $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe stdout (Mode::Write) () ($($rest)*) ($($opts)*) ($($chain)*))
+		spawn_internal!(@pipe stdout (pipes::Mode::Write) () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body (2) (> $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe stderr (Mode::Write) () ($($rest)*) ($($opts)*) ($($chain)*))
+		spawn_internal!(@pipe stderr (pipes::Mode::Write) () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body ($arg:expr) ($($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
@@ -429,15 +432,15 @@ macro_rules! spawn_internal {
 	};
 
 	// ========== PIPE =========================================================
-	(@pipe $pipe:ident (Mode::Write) (&) (1 $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!($pipe (PipeSetup::Redirect(Target::Stdout)) ($($opts)*) (@body () ($($rest)*)) ($($chain)*))
+	(@pipe $pipe:ident (pipes::Mode::Write) (&) (1 $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
+		spawn_internal!($pipe (pipes::PipeSetup::Redirect(pipes::Target::Stdout)) ($($opts)*) (@body () ($($rest)*)) ($($chain)*))
 	};
 
-	(@pipe $pipe:ident (Mode::Write) (&) (2 $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!($pipe (PipeSetup::Redirect(Target::Stderr)) ($($opts)*) (@body () ($($rest)*)) ($($chain)*))
+	(@pipe $pipe:ident (pipes::Mode::Write) (&) (2 $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
+		spawn_internal!($pipe (pipes::PipeSetup::Redirect(pipes::Target::Stderr)) ($($opts)*) (@body () ($($rest)*)) ($($chain)*))
 	};
 
-	(@pipe $pipe:ident (Mode::Write) (&) ($tok:tt $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
+	(@pipe $pipe:ident (pipes::Mode::Write) (&) ($tok:tt $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
 		sapwn_unexpected_token!($tok)
 	};
 
@@ -468,8 +471,8 @@ macro_rules! spawn {
 		// arguments: @marker (current token) (tokens to parse) ((stdin) (stdout) (stderr) (last) (argv) (envp)) (pipe chain array)
 		{
 			let chain =
-				spawn_internal!(@head () ($($tt)*) ((PipeSetup::Inherit) (PipeSetup::Pipe) (PipeSetup::Inherit) (Target::Stderr) () ()) ());
-			Chain::open(&chain[..])
+				spawn_internal!(@head () ($($tt)*) ((pipes::PipeSetup::Inherit) (pipes::PipeSetup::Pipe) (pipes::PipeSetup::Inherit) (pipes::Target::Stderr) () ()) ());
+			pipes::Chain::open(&chain[..])
 		}
 	}
 }
@@ -948,68 +951,4 @@ impl Chain {
 	pub fn wait(&mut self) -> Vec<Result<c_int>> {
 		self.children.iter_mut().map(|child| child.wait()).collect()
 	}
-}
-
-fn main() {
-//	let var = "foo bar";
-//	let word = "blubb";
-/*
-	let status = spawn!(
-		VAR1="egg spam" VAR2={var} echo "arg1" "arg2" {word} |
-		sed {"s/blubb/baz/"} |
-		cat >PipeSetup::Inherit
-	).expect("spawn failed").wait().expect("wait failed");
-	println!("status: {}", status);
-*/
-/*
-	let status = spawn!(
-		echo "hello world" >PipeSetup::Inherit
-	).expect("spawn failed").wait();
-	println!("statuses: {:?}", status);
-
-	let status = spawn!(
-		echo "hello world 2" >PipeSetup::Inherit
-	).expect("spawn failed").wait();
-	println!("statuses: {:?}", status);
-
-	let status = spawn!(
-		echo "hello world and cat" >&1 | cat >PipeSetup::Inherit
-	).expect("spawn failed").wait();
-	println!("statuses: {:?}", status);
-*/
-/*
-	let file = File::open("./src/main.rs").expect("couldn't open main.rs");
-	let mut chain = vec![
-		Pipes::pass_stdin(file.as_raw_fd(), &["grep", "new"]),
-		Pipes::pass_through(&["cat"]),
-		Pipes::last(&["wc", "-l"])
-	];
-//	chain[0].stdin(PipeSetup::Inherit);
-	let status = Chain::open(&chain[..]).expect("chain failed").wait().expect("wait failed");
-	println!("status: {}", status);
-*/
-/*
-	spawn!(
-		VAR1="egg spam" VAR2={var} getenv "VAR1"
-	).expect("spawn failed");
-*/
-	let status = spawn!(
-		grep "new" <"./src/main.rs" |
-		cat >&1 |
-		wc "-l" >>"./out.txt"
-	).expect("spawn failed").wait();
-	println!("statuses: {:?}", status);
-
-	let file = File::open("./src/main.rs").expect("couldn't open main.rs");
-	let status = spawn!(
-		grep "new" <file |
-		cat |
-		wc "-l" >PipeSetup::Inherit
-	).expect("spawn failed").wait();
-	println!("statuses: {:?}", status);
-
-	let status = spawn!(
-		FOO="BAR" "./getenv" "FOO" >PipeSetup::Inherit
-	).expect("spawn failed").wait();
-	println!("statuses: {:?}", status);
 }
