@@ -549,8 +549,8 @@ fn fd_from_setup(setup: &PipeSetup) -> Result<Fd> {
 
 			let fd = match mode {
 				Mode::Read   => unsafe { open(cstr!(name), O_RDONLY) },
-				Mode::Write  => unsafe { open(cstr!(name), O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH) },
-				Mode::Append => unsafe { open(cstr!(name), O_APPEND | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH) },
+				Mode::Write  => unsafe { open(cstr!(name), O_WRONLY | O_CREAT,            S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH) },
+				Mode::Append => unsafe { open(cstr!(name), O_WRONLY | O_CREAT | O_APPEND, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH) },
 			};
 
 			if fd < 0 {
