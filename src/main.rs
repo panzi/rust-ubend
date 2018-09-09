@@ -5,6 +5,7 @@ use std::result;
 use std::os::unix::io::{FromRawFd, AsRawFd};
 use std::collections::HashMap;
 use std::ffi::{CStr};
+use std::fmt::Display;
 use std::fs::File;
 use std::ptr;
 use std::env;
@@ -35,6 +36,9 @@ use libc::{
 	O_RDWR,
 	S_IRUSR,
 	S_IWUSR,
+	S_IRGRP,
+	S_IWGRP,
+	S_IROTH,
 	EOPNOTSUPP,
 	EISDIR,
 	ENOENT,
@@ -108,7 +112,7 @@ pub struct Chain {
 	children: Vec<Child>
 }
 
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Copy, Clone, PartialEq)]
 pub enum Error {
 	OS(c_int),
 	NotEnoughArguments,
@@ -171,6 +175,12 @@ macro_rules! c_err {
 	}
 }
 
+macro_rules! cstr {
+	($str:expr) => {
+		($str).as_ptr() as *const c_char
+	}
+}
+
 impl Child {
 	fn kill(&mut self, sig: c_int) -> Result<()> {
 		if unsafe { kill(self.pid, sig) } == -1 {
@@ -196,49 +206,81 @@ impl Drop for Child {
 	}
 }
 
-impl Error {
-	pub fn to_str(&self) -> String {
+impl Display for Error {
+	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
 		match self {
 			Error::OS(errno) => {
+				write!(f, "OS error code {}: ", *errno)?;
+
 				let mut buf = [0u8; 4096];
 				let res: c_int = unsafe {
 					strerror_r(*errno, buf.as_mut_ptr() as *mut c_char, buf.len())
 				};
-				if res == 0 {
-					match CStr::from_bytes_with_nul(&buf[..]) {
-						Ok(errstr) => {
-							return match errstr.to_str() {
-								Ok(s) => s.to_string(),
-								_ => "error getting error string (broken UTF-8 encoding)".to_string()
-							}
-						},
-						_ => {}
-					}
+				if res != 0 {
+					return write!(f,
+						"(Another OS error (code {}) occured getting the error string)",
+						if res > 0 { res } else { unsafe { *__errno_location() } });
 				}
 
-				"error getting error string".to_string()
+				let index = buf.iter().position(|b| *b == 0);
+				let index = match index {
+					Some(index) => index,
+					None => {
+						return write!(f, "(Error getting error string: no nul byte in error string)");
+					}
+				};
+
+				match CStr::from_bytes_with_nul(&buf[..=index]) {
+					Ok(errstr) => {
+						match errstr.to_str() {
+							Ok(s) => {
+								return f.write_str(s);
+							},
+							Err(err) => {
+								return write!(f, "(Error getting error string: {})", err);
+							}
+						}
+					},
+					Err(err) => {
+						return write!(f, "(Error getting error string: {})", err);
+					}
+				}
 			},
-			Error::NotEnoughArguments => "not enough arguments (need at least one)".to_string(),
-			Error::CannotRedirectStdinTo(Target::Stdout) => "cannot redirect stdin to stdout".to_string(),
-			Error::CannotRedirectStdinTo(Target::Stderr) => "cannot redirect stdin to stderr".to_string(),
-			Error::NotEnoughPipes => "not enough pipes (need at least one)".to_string(),
-			Error::InvalidPipeLinkup => "invalid pipe linkup".to_string()
+			Error::NotEnoughArguments => f.write_str("not enough arguments (need at least one)"),
+			Error::CannotRedirectStdinTo(Target::Stdout) => f.write_str("cannot redirect stdin to stdout"),
+			Error::CannotRedirectStdinTo(Target::Stderr) => f.write_str("cannot redirect stdin to stderr"),
+			Error::NotEnoughPipes => f.write_str("not enough pipes (need at least one)"),
+			Error::InvalidPipeLinkup => f.write_str("invalid pipe linkup")
 		}
 	}
 }
 
+impl std::fmt::Debug for Error {
+	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
+		(self as &Display).fmt(f)
+	}
+}
+
+#[macro_export]
+#[doc(hidden)]
 macro_rules! sapwn_unexpected_end {
 	($tt:tt) => {}
 }
 
+#[macro_export]
+#[doc(hidden)]
 macro_rules! sapwn_unexpected_token {
 	() => {}
 }
 
+#[macro_export]
+#[doc(hidden)]
 macro_rules! sapwn_illegal_mode {
 	() => {}
 }
 
+#[macro_export]
+#[doc(hidden)]
 macro_rules! spawn_internal_envp {
 	($((($($key:tt)*) ($($val:tt)*)))*) => {
 		{
@@ -249,6 +291,8 @@ macro_rules! spawn_internal_envp {
 	}
 }
 
+#[macro_export]
+#[doc(hidden)]
 macro_rules! spawn_internal {
 	(stdin ($($stream:tt)*) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($cont:tt)*) ($($chain:tt)*)) => {
 		spawn_internal!($($cont)* (($($stream)*) ($($stdout)*) ($($stderr)*) ($($last)*) ($($argv)*) ($($envp)*)) ($($chain)*))
@@ -418,6 +462,7 @@ macro_rules! spawn_internal {
 	};
 }
 
+#[macro_export]
 macro_rules! spawn {
 	($($tt:tt)*) => {
 		// arguments: @marker (current token) (tokens to parse) ((stdin) (stdout) (stderr) (last) (argv) (envp)) (pipe chain array)
@@ -426,12 +471,6 @@ macro_rules! spawn {
 				spawn_internal!(@head () ($($tt)*) ((PipeSetup::Inherit) (PipeSetup::Pipe) (PipeSetup::Inherit) (Target::Stderr) () ()) ());
 			Chain::open(&chain[..])
 		}
-	}
-}
-
-macro_rules! cstr {
-	($str:expr) => {
-		($str).as_ptr() as *const c_char
 	}
 }
 
@@ -502,22 +541,26 @@ fn redirect_fd(oldfd: c_int, newfd: c_int, errmsg: *const c_char) {
 	}
 }
 
-fn fd_from_setup(setup: &PipeSetup) -> Fd {
-	Fd {
-		fd: match setup {
-			PipeSetup::File(ref name, mode) => {
-				let flags = O_CREAT | match mode {
-					Mode::Read   => O_RDONLY,
-					Mode::Write  => O_WRONLY,
-					Mode::Append => O_APPEND,
-				};
-				let mut bytes = name.clone().into_bytes();
-				bytes.push(0);
-				unsafe { open(cstr!(name), flags) }
-			},
-			PipeSetup::FileDescr(fd) => *fd,
-			_ => -1
-		}
+fn fd_from_setup(setup: &PipeSetup) -> Result<Fd> {
+	match setup {
+		PipeSetup::File(ref name, mode) => {
+			let mut name = name.clone().into_bytes();
+			name.push(0);
+
+			let fd = match mode {
+				Mode::Read   => unsafe { open(cstr!(name), O_RDONLY) },
+				Mode::Write  => unsafe { open(cstr!(name), O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH) },
+				Mode::Append => unsafe { open(cstr!(name), O_APPEND | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH) },
+			};
+
+			if fd < 0 {
+				c_err!()
+			} else {
+				Ok(Fd { fd: fd })
+			}
+		},
+		PipeSetup::FileDescr(fd) => Ok(Fd { fd: *fd }),
+		_ => Ok(Fd { fd: -1 })
 	}
 }
 
@@ -651,10 +694,16 @@ impl Pipes {
 	}
 
 	pub fn open(&self) -> Result<Child> {
-		// imediately consume file descriptors
-		let mut infd  = fd_from_setup(&self.stdin);
-		let mut outfd = fd_from_setup(&self.stdout);
-		let mut errfd = fd_from_setup(&self.stderr);
+		// imediately consume file descriptors so that they are closed
+		// by the Fd destructor in any case
+		let infd  = fd_from_setup(&self.stdin);
+		let outfd = fd_from_setup(&self.stdout);
+		let errfd = fd_from_setup(&self.stderr);
+
+		// only now handle errors
+		let mut infd  = infd?;
+		let mut outfd = outfd?;
+		let mut errfd = errfd?;
 
 		if self.argv.len() == 0 {
 			return Err(Error::NotEnoughArguments);
@@ -902,8 +951,8 @@ impl Chain {
 }
 
 fn main() {
-	let var = "foo bar";
-	let word = "blubb";
+//	let var = "foo bar";
+//	let word = "blubb";
 /*
 	let status = spawn!(
 		VAR1="egg spam" VAR2={var} echo "arg1" "arg2" {word} |
@@ -947,7 +996,7 @@ fn main() {
 	let status = spawn!(
 		grep "new" <"./src/main.rs" |
 		cat >&1 |
-		wc "-l" >PipeSetup::Inherit
+		wc "-l" >>"./out.txt"
 	).expect("spawn failed").wait();
 	println!("statuses: {:?}", status);
 
