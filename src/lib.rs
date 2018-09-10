@@ -28,6 +28,14 @@ use libc::{
 	exit,
 	kill,
 	waitpid,
+	WIFEXITED,
+	WEXITSTATUS,
+	WIFSIGNALED,
+	WTERMSIG,
+	WCOREDUMP,
+	WIFSTOPPED,
+	WSTOPSIG,
+	WIFCONTINUED,
 	c_int,
 	c_char,
 	__errno_location, // Linux?
@@ -46,6 +54,7 @@ use libc::{
 	EISDIR,
 	ENOENT,
 	ECHILD,
+	EINVAL,
 	EXIT_FAILURE,
 	STDIN_FILENO,
 	STDOUT_FILENO,
@@ -184,6 +193,10 @@ pub struct Chain {
 pub enum Error {
 	OS(c_int),
 	IO(std::io::Error),
+	ChildSignaled(c_int),
+	ChildCoreDumped,
+	ChildStopped(c_int),
+	ChildContinued,
 	NotEnoughArguments,
 	CannotRedirectStdinTo(Target),
 	NotEnoughPipes,
@@ -261,8 +274,28 @@ impl Child {
 		if unsafe { waitpid(self.pid, &mut status, 0) } == -1 {
 			return c_err!();
 		}
-		self.pid = -1;
-		Ok(status)
+
+		if unsafe { WIFEXITED(status) } {
+			return Ok(unsafe { WEXITSTATUS(status) });
+		}
+
+		if unsafe { WIFSIGNALED(status) } {
+			return Err(Error::ChildSignaled(unsafe { WTERMSIG(status) }));
+		}
+
+		if unsafe { WCOREDUMP(status) } {
+			return Err(Error::ChildCoreDumped);
+		}
+
+		if unsafe { WIFSTOPPED(status) } {
+			return Err(Error::ChildStopped(unsafe { WSTOPSIG(status) }));
+		}
+
+		if unsafe { WIFCONTINUED(status) } {
+			return Err(Error::ChildContinued);
+		}
+
+		return Err(Error::OS(EINVAL));
 	}
 }
 
@@ -313,7 +346,11 @@ impl Display for Error {
 			Error::CannotRedirectStdinTo(Target::Stdout) => f.write_str("cannot redirect stdin to stdout"),
 			Error::CannotRedirectStdinTo(Target::Stderr) => f.write_str("cannot redirect stdin to stderr"),
 			Error::NotEnoughPipes => f.write_str("not enough pipes (need at least one)"),
-			Error::InvalidPipeLinkup => f.write_str("invalid pipe linkup")
+			Error::InvalidPipeLinkup => f.write_str("invalid pipe linkup"),
+			Error::ChildSignaled(sig) => write!(f, "child exited with signal: {}", sig),
+			Error::ChildCoreDumped => f.write_str("child core dumped"),
+			Error::ChildStopped(sig) => write!(f, "child stopped with signal: {}", sig),
+			Error::ChildContinued => f.write_str("child continued"),
 		}
 	}
 }
@@ -1031,13 +1068,19 @@ impl Chain {
 			(Some(mut out), None) => {
 				match out.read_to_end(&mut stdout) {
 					Ok(_) => {},
-					Err(err) => return Err(Error::IO(err))
+					Err(err) => {
+//						println!("XXXXXXXXXX READ ERROR stdin");
+						return Err(Error::IO(err));
+					}
 				}
 			},
 			(None, Some(mut err)) => {
 				match err.read_to_end(&mut stdout) {
 					Ok(_) => {},
-					Err(err) => return Err(Error::IO(err))
+					Err(err) => {
+//						println!("XXXXXXXXXX READ ERROR stderr");
+						return Err(Error::IO(err));
+					}
 				}
 			},
 			(Some(mut out), Some(mut err)) => {
@@ -1059,6 +1102,7 @@ impl Chain {
 					let res = unsafe { poll(pollfds.as_mut_ptr(), 2, -1) };
 
 					if res < 0 {
+//						println!("XXXXXXXXXX POLL ERROR");
 						return c_err!();
 					}
 
@@ -1067,7 +1111,10 @@ impl Chain {
 							Ok(size) => {
 								stdout.extend_from_slice(&mut buf[..size]);
 							},
-							Err(err) => return Err(Error::IO(err))
+							Err(err) => {
+//								println!("XXXXXXXXXX POLL READ ERROR stdout");
+								return Err(Error::IO(err));
+							}
 						}
 					}
 
@@ -1085,7 +1132,10 @@ impl Chain {
 							Ok(size) => {
 								stderr.extend_from_slice(&mut buf[..size]);
 							},
-							Err(err) => return Err(Error::IO(err))
+							Err(err) => {
+//								println!("XXXXXXXXXX POLL READ ERROR stdout");
+								return Err(Error::IO(err));
+							}
 						}
 					}
 					
