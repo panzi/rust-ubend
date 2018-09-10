@@ -2,7 +2,7 @@ extern crate libc;
 
 use std::vec::Vec;
 use std::result;
-use std::os::unix::io::{FromRawFd, IntoRawFd, AsRawFd};
+use std::os::unix::io::{FromRawFd, RawFd, IntoRawFd, AsRawFd};
 use std::collections::HashMap;
 use std::ffi::{CStr};
 use std::fmt::Display;
@@ -19,7 +19,6 @@ use libc::{
 	perror,
 	open,
 	close,
-	dup,
 	dup2,
 	pid_t,
 	execvp,
@@ -575,6 +574,14 @@ pub struct Fd {
 	fd: c_int
 }
 
+impl IntoRawFd for Fd {
+	fn into_raw_fd(mut self) -> RawFd {
+		let fd = self.fd;
+		self.fd = -1;
+		fd
+	}
+}
+
 impl Drop for Fd {
 	fn drop(&mut self) {
 		if self.fd >= 0 {
@@ -829,11 +836,7 @@ impl Pipes {
 				if infd.fd < 0 {
 					return c_err!();
 				}
-				let fd = unsafe { dup(infd.fd) };
-				if fd < 0 {
-					return c_err!();
-				}
-				Some(unsafe { File::from_raw_fd(fd) })
+				None // see below
 			},
 			PipeSetup::Null => {
 				infd.fd = unsafe { open(cstr!(b"/dev/null\0"), O_RDONLY) };
@@ -865,11 +868,7 @@ impl Pipes {
 				if outfd.fd < 0 {
 					return c_err!();
 				}
-				let fd = unsafe { dup(outfd.fd) };
-				if fd < 0 {
-					return c_err!();
-				}
-				Some(unsafe { File::from_raw_fd(fd) })
+				None // see below
 			},
 			PipeSetup::Null => {
 				outfd.fd = unsafe { open(cstr!(b"/dev/null\0"), O_WRONLY) };
@@ -898,11 +897,7 @@ impl Pipes {
 				if errfd.fd < 0 {
 					return c_err!();
 				}
-				let fd = unsafe { dup(errfd.fd) };
-				if fd < 0 {
-					return c_err!();
-				}
-				Some(unsafe { File::from_raw_fd(fd) })
+				None // see below
 			},
 			PipeSetup::Null => {
 				errfd.fd = unsafe { open(cstr!(b"/dev/null\0"), O_WRONLY) };
@@ -952,7 +947,21 @@ impl Pipes {
 			unsafe { exit(EXIT_FAILURE); }
 		} else {
 			// parent
-			Ok(Child { pid, stdin, stdout, stderr })
+			Ok(Child {
+				pid,
+
+				stdin: if stdin_setup.is_temp() {
+					Some(unsafe { File::from_raw_fd(infd.into_raw_fd()) })
+				} else { stdin },
+
+				stdout: if stdout_setup.is_temp() {
+					Some(unsafe { File::from_raw_fd(outfd.into_raw_fd()) })
+				} else { stdout },
+
+				stderr: if stderr_setup.is_temp() {
+					Some(unsafe { File::from_raw_fd(errfd.into_raw_fd()) })
+				} else { stderr }
+			})
 		}
 	}
 
