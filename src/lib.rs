@@ -44,11 +44,11 @@ use libc::{
 	EOPNOTSUPP,
 	EISDIR,
 	ENOENT,
+	ECHILD,
 	EXIT_FAILURE,
 	STDIN_FILENO,
 	STDOUT_FILENO,
 	STDERR_FILENO,
-	SIGTERM,
 	BUFSIZ,
 	poll,
 	pollfd,
@@ -233,6 +233,7 @@ impl IntoPipeSetup for File {
 
 macro_rules! c_err {
 	() => {
+		//panic!("C error: {}", unsafe { *__errno_location() });
 		Err(Error::OS(unsafe { *__errno_location() }))
 	}
 }
@@ -252,19 +253,15 @@ impl Child {
 	}
 
 	fn wait(&mut self) -> Result<c_int> {
+		if self.pid <= 0 {
+			return Err(Error::OS(ECHILD));
+		}
 		let mut status: c_int = -1;
 		if unsafe { waitpid(self.pid, &mut status, 0) } == -1 {
 			return c_err!();
 		}
+		self.pid = -1;
 		Ok(status)
-	}
-}
-
-impl Drop for Child {
-	fn drop(&mut self) {
-		if self.pid >= 0 {
-			match self.kill(SIGTERM) { _ => {} }
-		}
 	}
 }
 
@@ -540,22 +537,12 @@ pub struct Fd {
 	fd: c_int
 }
 
-impl Fd {
-	pub fn new() -> Self {
-		Fd { fd: -1 }
-	}
-
-	pub fn close(&mut self) {
+impl Drop for Fd {
+	fn drop(&mut self) {
 		if self.fd >= 0 {
 			unsafe { close(self.fd); }
 			self.fd = -1;
 		}
-	}
-}
-
-impl Drop for Fd {
-	fn drop(&mut self) {
-		self.close();
 	}
 }
 
@@ -1036,7 +1023,8 @@ impl Chain {
 		drop(self.children[0].stdin.take());
 
 		let index = self.children.len() - 1;
-		let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+		let mut stdout = Vec::new();
+		let mut stderr = Vec::new();
 		match (self.children[index].stdout.take(), self.children[index].stderr.take()) {
 			(None, None) => {},
 			(Some(mut out), None) => {
@@ -1083,6 +1071,7 @@ impl Chain {
 					}
 
 					if pollfds[0].revents & (POLLERR | POLLHUP) != 0 {
+						pollfds[0].fd = -1;
 						pollfds[0].events = 0;
 					}
 
@@ -1100,6 +1089,7 @@ impl Chain {
 					}
 					
 					if pollfds[1].revents & (POLLERR | POLLHUP) != 0 {
+						pollfds[1].fd = -1;
 						pollfds[1].events = 0;
 					}
 

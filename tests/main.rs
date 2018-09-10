@@ -70,16 +70,15 @@ fn stdio() {
 
 #[test]
 fn read_and_write_file_by_name() {
-	let mut chain = spawn!(
-		grep "new" <"./src/lib.rs" |
+	assert_wait!(spawn!(
+		grep "spam" <"./tests/input.txt" |
 		cat >&1 |
 		wc "-l" >"./tests/read_and_write_file_by_name.txt"
-	).expect("spawn failed");
-	assert_wait!(chain);
+	).expect("spawn failed"));
 
 	assert_file_contens!(
 		"./tests/read_and_write_file_by_name.txt",
-		"14\n");
+		"3\n");
 }
 
 #[test]
@@ -90,28 +89,27 @@ fn write_file_by_handle() {
 	open("./tests/write_file_by_handle.txt").
 	expect("couldn't open write_file_by_handle.txt");
 
-	let mut chain = spawn!(
-		grep "new" <"./src/lib.rs" |
+	assert_wait!(spawn!(
+		grep "spam" <"./tests/input.txt" |
 		cat >&1 |
 		wc "-l" >file
-	).expect("spawn failed");
-	assert_wait!(chain);
+	).expect("spawn failed"));
 
 	assert_file_contens!(
 		"./tests/write_file_by_handle.txt",
-		"14\n");
+		"3\n");
 }
 
 #[test]
 fn read_file_by_handle() {
-	let file = File::open("./src/lib.rs").expect("couldn't open lib.rs");
+	let file = File::open("./tests/input.txt").expect("couldn't open input.txt");
 	assert_output!(spawn!(
-		grep "new" <file |
+		grep "spam" <file |
 		cat |
 		wc "-l"
-	), "14\n");
+	), "3\n");
 }
-/*
+
 #[test]
 fn append() {
 	assert_wait!(
@@ -126,7 +124,7 @@ fn append() {
 
 	assert_file_contens!("./tests/append.txt", "first line\nsecond line\n");
 }
-*/
+
 #[test]
 fn setenv() {
 	assert_output!(
@@ -142,7 +140,7 @@ fn main() {
 	read_and_write_file_by_name();
 	write_file_by_handle();
 	read_file_by_handle();
-	//append();
+	append();
 	setenv();
 }
 */
