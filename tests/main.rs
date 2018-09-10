@@ -5,6 +5,8 @@ use pipes::IntoPipeSetup;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Read;
+use std::path::Path;
+use std::fs::remove_file;
 
 macro_rules! assert_output {
 	($chain:expr, $stdout:expr, $stderr:expr) => {
@@ -60,6 +62,13 @@ macro_rules! assert_file_contens {
 	};
 }
 
+fn remove_output_file(name: &str) {
+	if Path::new(name).exists() {
+		let msg = format!("error removing file: {}", name);
+		remove_file(name).expect(msg.as_str());
+	}
+}
+
 // FIXME: there are weird random crashes where I have no idea what's happening
 #[test]
 fn stdio() {
@@ -70,6 +79,8 @@ fn stdio() {
 
 #[test]
 fn read_and_write_file_by_name() {
+	remove_output_file("./tests/read_and_write_file_by_name.txt");
+
 	assert_wait!(spawn!(
 		grep "spam" <"./tests/input.txt" |
 		cat >&1 |
@@ -83,9 +94,12 @@ fn read_and_write_file_by_name() {
 
 #[test]
 fn write_file_by_handle() {
+	remove_output_file("./tests/write_file_by_handle.txt");
+
 	let file = OpenOptions::new().
 	write(true).
 	create(true).
+	truncate(true).
 	open("./tests/write_file_by_handle.txt").
 	expect("couldn't open write_file_by_handle.txt");
 
@@ -112,6 +126,8 @@ fn read_file_by_handle() {
 
 #[test]
 fn append() {
+	remove_output_file("./tests/append.txt");
+
 	assert_wait!(
 		spawn!(echo "first line" > "./tests/append.txt").
 		expect("spawn failed"));
