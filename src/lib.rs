@@ -67,6 +67,12 @@ use libc::{
 	POLLNVAL
 };
 
+// Linux!
+#[link(name = "c")]
+extern {
+	static mut environ: *const*const c_char;
+}
+
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum Target {
 	Stdout,
@@ -911,6 +917,48 @@ impl Pipes {
 			}
 		};
 
+		// doing malloc()ing stuff before fork()
+		let argv: Vec<Vec<u8>> = self.argv.iter().map(|arg| {
+			let mut bytes = arg.clone().into_bytes();
+			bytes.push(0);
+			bytes
+		}).collect();
+		let mut c_argv: Vec<*const c_char> = argv.iter().map(|arg| cstr!(arg[..])).collect();
+		c_argv.push(ptr::null());
+
+		let envp = if self.envp.is_empty() {
+			None
+		} else {
+			let mut envp = HashMap::<Vec<u8>, Vec<u8>>::new();
+			for (key, value) in env::vars() {
+				let key = key.into_bytes();
+				let value = value.into_bytes();
+
+				envp.insert(key, value);
+			}
+
+			for (key, value) in self.envp {
+				let key = key.into_bytes();
+				let value = value.into_bytes();
+
+				envp.insert(key, value);
+			}
+
+			let envp: Vec<Vec<u8>> = envp.iter().map(|(key, value)| {
+				let mut bytes = Vec::<u8>::new();
+				bytes.extend_from_slice(&key[..]);
+				bytes.push('=' as u8);
+				bytes.extend_from_slice(&value[..]);
+				bytes.push(0);
+				bytes
+			}).collect();
+
+			let mut c_envp: Vec<*const c_char> = envp.iter().map(|var| cstr!(var[..])).collect();
+			c_envp.push(ptr::null());
+
+			Some((envp, c_envp))
+		};
+
 		let pid = unsafe { fork() };
 
 		if pid == -1 {
@@ -919,14 +967,6 @@ impl Pipes {
 
 		if pid == 0 {
 			// child
-			let argv: Vec<Vec<u8>> = self.argv.iter().map(|arg| {
-				let mut bytes = arg.clone().into_bytes();
-				bytes.push(0);
-				bytes
-			}).collect();
-			let mut c_argv: Vec<*const c_char> = argv.iter().map(|arg| cstr!(arg[..])).collect();
-			c_argv.push(ptr::null());
-
 			redirect_fd(infd.fd, STDIN_FILENO, cstr!(b"redirecting stdin\0"));
 
 			if self.last == Target::Stderr {
@@ -937,8 +977,8 @@ impl Pipes {
 				redirect_stdout(&stdout_setup, outfd.fd);
 			}
 
-			for (key, val) in &self.envp {
-				env::set_var(key, val);
+			if let Some((_, ref c_envp)) = envp {
+				unsafe { environ = (&c_envp[..]).as_ptr(); }
 			}
 
 			if unsafe { execvp(c_argv[0], (&c_argv[..]).as_ptr()) } == -1 {
@@ -1062,11 +1102,17 @@ impl Chain {
 		}
 	}
 
-	pub fn wait(&mut self) -> Vec<Result<c_int>> {
+	pub fn wait_all(&mut self) -> Vec<Result<c_int>> {
 		self.children.iter_mut().map(|child| child.wait()).collect()
 	}
 
+	pub fn wait_last(&mut self) -> Result<c_int> {
+		let index = self.children.len() - 1;
+		self.children[index].wait()
+	}
+
 	pub fn output(mut self) -> Result<Output> {
+		//println!("XXXXXXXXXX output()");
 		drop(self.children[0].stdin.take());
 
 		let index = self.children.len() - 1;
@@ -1078,7 +1124,7 @@ impl Chain {
 				match out.read_to_end(&mut stdout) {
 					Ok(_) => {},
 					Err(err) => {
-//						println!("XXXXXXXXXX READ ERROR stdin");
+						//println!("XXXXXXXXXX READ ERROR stdin");
 						return Err(Error::IO(err));
 					}
 				}
@@ -1087,7 +1133,7 @@ impl Chain {
 				match err.read_to_end(&mut stdout) {
 					Ok(_) => {},
 					Err(err) => {
-//						println!("XXXXXXXXXX READ ERROR stderr");
+						//println!("XXXXXXXXXX READ ERROR stderr");
 						return Err(Error::IO(err));
 					}
 				}
@@ -1111,7 +1157,7 @@ impl Chain {
 					let res = unsafe { poll(pollfds.as_mut_ptr(), 2, -1) };
 
 					if res < 0 {
-//						println!("XXXXXXXXXX POLL ERROR");
+						//println!("XXXXXXXXXX POLL ERROR");
 						return c_err!();
 					}
 
@@ -1121,7 +1167,7 @@ impl Chain {
 								stdout.extend_from_slice(&mut buf[..size]);
 							},
 							Err(err) => {
-//								println!("XXXXXXXXXX POLL READ ERROR stdout");
+								//println!("XXXXXXXXXX POLL READ ERROR stdout");
 								return Err(Error::IO(err));
 							}
 						}
@@ -1142,7 +1188,7 @@ impl Chain {
 								stderr.extend_from_slice(&mut buf[..size]);
 							},
 							Err(err) => {
-//								println!("XXXXXXXXXX POLL READ ERROR stdout");
+								//println!("XXXXXXXXXX POLL READ ERROR stdout");
 								return Err(Error::IO(err));
 							}
 						}
