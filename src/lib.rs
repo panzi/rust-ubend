@@ -685,7 +685,7 @@ fn redirect_stderr(stderr: &PipeSetup, fd: c_int) {
 	if stderr.is_redirect_to(Target::Stdout) {
 		if unsafe { dup2(STDOUT_FILENO, STDERR_FILENO) } == -1 {
 			unsafe {
-				perror(cstr!(b"redirecting stdout\0"));
+				perror(cstr!(b"redirecting stderr\0"));
 				exit(EXIT_FAILURE);
 			}
 		}
@@ -944,19 +944,26 @@ impl Pipes {
 				envp.insert(key, value);
 			}
 
-			let envp: Vec<Vec<u8>> = envp.iter().map(|(key, value)| {
-				let mut bytes = Vec::<u8>::new();
-				bytes.extend_from_slice(&key[..]);
-				bytes.push('=' as u8);
-				bytes.extend_from_slice(&value[..]);
-				bytes.push(0);
-				bytes
-			}).collect();
+			let mut envp2 = Vec::<u8>::new();
+			let mut c_envp = Vec::<*const c_char>::with_capacity(envp.len());
+			for (key, value) in envp {
+				envp2.extend_from_slice(&key[..]);
+				envp2.push('=' as u8);
+				envp2.extend_from_slice(&value[..]);
+				envp2.push(0);
+			}
 
-			let mut c_envp: Vec<*const c_char> = envp.iter().map(|var| cstr!(var[..])).collect();
+			let mut index = 0;
+			let len = envp2.len();
+			while index < len {
+				if envp2[index] == 0 && index + 1 < len {
+					c_envp.push(cstr!(envp2[index + 1..]));
+				}
+				index += 1;
+			}
 			c_envp.push(ptr::null());
 
-			Some((envp, c_envp))
+			Some((envp2, c_envp))
 		};
 
 		let pid = unsafe { fork() };
