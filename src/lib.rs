@@ -68,10 +68,18 @@ use libc::{
 	POLLNVAL
 };
 
-// Linux!
-#[link(name = "c")]
-extern {
-	static mut environ: *const*const c_char;
+#[cfg(target_os = "macos")]
+#[inline]
+unsafe fn environ() -> *mut *const *const c_char {
+	extern { fn _NSGetEnviron() -> *mut *const *const c_char; }
+	_NSGetEnviron()
+}
+
+#[cfg(not(target_os = "macos"))]
+#[inline]
+unsafe fn environ() -> *mut *const *const c_char {
+	extern { static mut environ: *const *const c_char; }
+	&mut environ
 }
 
 macro_rules! cstr {
@@ -799,7 +807,7 @@ fn pipes_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 			}
 
 			if envp != ptr::null() {
-				environ = envp;
+				*environ() = envp;
 			}
 
 			if execvp(*argv, argv) == -1 {
