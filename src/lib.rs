@@ -261,14 +261,20 @@ pub trait IntoPipeSetup {
 }
 
 impl PipeSetup {
-	pub fn into_pipe_setup(self, _mode: Mode) -> PipeSetup {
-		self
+	pub fn into_pipe_setup(self, mode: Mode) -> PipeSetup {
+		match self {
+			PipeSetup::FileName(name, _) => PipeSetup::FileName(name, mode),
+			setup => setup
+		}
 	}
 }
 
 impl IntoPipeSetup for PipeSetup {
-	fn into_pipe_setup(self, _mode: Mode) -> PipeSetup {
-		self
+	fn into_pipe_setup(self, mode: Mode) -> PipeSetup {
+		match self {
+			PipeSetup::FileName(name, _) => PipeSetup::FileName(name, mode),
+			setup => setup
+		}
 	}
 }
 
@@ -292,7 +298,6 @@ impl IntoPipeSetup for File {
 
 macro_rules! c_err {
 	() => {
-		//panic!("C error: {}", unsafe { *__errno_location() });
 		Err(Error::OS(unsafe { *__errno_location() }))
 	}
 }
