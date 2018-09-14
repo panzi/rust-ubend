@@ -13,8 +13,6 @@ macro_rules! assert_output {
 		let out = $chain.expect("spawn failed").
 		output().expect("reading output failed");
 
-		assert_eq!(out.status, 0);
-
 		assert_eq!(
 			String::from_utf8(out.stdout).
 			expect("reading UTF-8 from stdout failed"),
@@ -24,17 +22,20 @@ macro_rules! assert_output {
 			String::from_utf8(out.stderr).
 			expect("reading UTF-8 from stderr failed"),
 			$stderr);
+
+		assert_eq!(out.status, 0);
 	};
 
 	($chain:expr, $stdout:expr) => {
 		let out = $chain.expect("spawn failed").
 		output().expect("reading output failed");
 
-		assert_eq!(out.status, 0);
 		assert_eq!(
 			String::from_utf8(out.stdout).
 			expect("reading UTF-8 from stdout failed"),
 			$stdout);
+
+		assert_eq!(out.status, 0);
 	};
 }
 

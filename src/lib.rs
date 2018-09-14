@@ -2,14 +2,14 @@ extern crate libc;
 
 use std::vec::Vec;
 use std::result;
-use std::os::unix::io::{FromRawFd, RawFd, IntoRawFd, AsRawFd};
+use std::os::unix::io::{FromRawFd, IntoRawFd, AsRawFd};
 use std::collections::HashMap;
 use std::ffi::{CStr};
 use std::fmt::Display;
 use std::fs::File;
 use std::ptr;
 use std::env;
-use std::mem::{swap, drop};
+use std::mem::drop;
 use std::io::Read;
 
 use libc::{
@@ -26,6 +26,7 @@ use libc::{
 	unlink,
 	exit,
 	kill,
+	SIGTERM,
 	waitpid,
 	WIFEXITED,
 	WEXITSTATUS,
@@ -71,6 +72,12 @@ use libc::{
 #[link(name = "c")]
 extern {
 	static mut environ: *const*const c_char;
+}
+
+macro_rules! cstr {
+	($str:expr) => {
+		($str).as_ptr() as *const c_char
+	}
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -168,6 +175,31 @@ impl PipeSetup {
 			_ => false
 		}
 	}
+
+	unsafe fn into_raw_fd(self) -> c_int {
+		match self {
+			PipeSetup::Inherit => PIPES_INHERIT,
+			PipeSetup::Pipe => PIPES_PIPE,
+			PipeSetup::Null => PIPES_NULL,
+			PipeSetup::Redirect(Target::Stdout) => PIPES_TO_STDOUT,
+			PipeSetup::Redirect(Target::Stderr) => PIPES_TO_STDERR,
+			PipeSetup::Temp => PIPES_TEMP,
+			PipeSetup::FileDescr(fd) => fd,
+			PipeSetup::FileName(name, mode) => {
+				let mut name = name.into_bytes();
+				name.push(0);
+
+				let fd = match mode {
+					Mode::Read   => open(cstr!(name), O_RDONLY),
+					Mode::Write  => open(cstr!(name), O_WRONLY | O_CREAT | O_TRUNC,  S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH),
+					Mode::Append => open(cstr!(name), O_WRONLY | O_CREAT | O_APPEND, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH),
+				};
+
+				fd
+			}
+			PipeSetup::File(file) => file.into_raw_fd()
+		}
+	}
 }
 
 #[derive(Debug)]
@@ -181,16 +213,16 @@ pub struct Pipes {
 }
 
 #[derive(Debug)]
-pub struct Child {
-	pub pid: pid_t,
-	pub stdin:  Option<File>,
-	pub stdout: Option<File>,
-	pub stderr: Option<File>
+struct ChildIntern {
+	pid:   pid_t,
+	infd:  c_int,
+	outfd: c_int,
+	errfd: c_int,
 }
 
 #[derive(Debug)]
 pub struct Chain {
-	children: Vec<Child>
+	children: Vec<ChildIntern>
 }
 
 // TODO: Split up and only declare the errors for a function
@@ -254,53 +286,6 @@ macro_rules! c_err {
 	() => {
 		//panic!("C error: {}", unsafe { *__errno_location() });
 		Err(Error::OS(unsafe { *__errno_location() }))
-	}
-}
-
-macro_rules! cstr {
-	($str:expr) => {
-		($str).as_ptr() as *const c_char
-	}
-}
-
-impl Child {
-	fn kill(&mut self, sig: c_int) -> Result<()> {
-		if unsafe { kill(self.pid, sig) } == -1 {
-			return c_err!();
-		}
-		Ok(())
-	}
-
-	fn wait(&mut self) -> Result<c_int> {
-		if self.pid <= 0 {
-			return Err(Error::OS(ECHILD));
-		}
-		let mut status: c_int = -1;
-		if unsafe { waitpid(self.pid, &mut status, 0) } == -1 {
-			return c_err!();
-		}
-
-		if unsafe { WIFEXITED(status) } {
-			return Ok(unsafe { WEXITSTATUS(status) });
-		}
-
-		if unsafe { WIFSIGNALED(status) } {
-			return Err(Error::ChildSignaled(unsafe { WTERMSIG(status) }));
-		}
-
-		if unsafe { WCOREDUMP(status) } {
-			return Err(Error::ChildCoreDumped);
-		}
-
-		if unsafe { WIFSTOPPED(status) } {
-			return Err(Error::ChildStopped(unsafe { WSTOPSIG(status) }));
-		}
-
-		if unsafe { WIFCONTINUED(status) } {
-			return Err(Error::ChildContinued);
-		}
-
-		return Err(Error::OS(EINVAL));
 	}
 }
 
@@ -570,30 +555,9 @@ macro_rules! spawn_internal {
 #[macro_export]
 macro_rules! spawn {
 	($($tt:tt)*) => {
-		pipes::Chain::open(
+		pipes::Chain::new(
 			// arguments: @marker (current token) (tokens to parse) ((stdin) (stdout) (stderr) (last) (argv) (envp)) (pipe chain array)
 			spawn_internal!(@head () ($($tt)*) ((pipes::PipeSetup::Inherit) (pipes::PipeSetup::Pipe) (pipes::PipeSetup::Inherit) (pipes::Target::Stderr) () ()) ()))
-	}
-}
-
-pub struct Fd {
-	fd: c_int
-}
-
-impl IntoRawFd for Fd {
-	fn into_raw_fd(mut self) -> RawFd {
-		let fd = self.fd;
-		self.fd = -1;
-		fd
-	}
-}
-
-impl Drop for Fd {
-	fn drop(&mut self) {
-		if self.fd >= 0 {
-			unsafe { close(self.fd); }
-			self.fd = -1;
-		}
 	}
 }
 
@@ -641,61 +605,260 @@ fn redirect_fd(oldfd: c_int, newfd: c_int, errmsg: *const c_char) {
 	}
 }
 
-fn convert_setup(setup: PipeSetup) -> Result<(PipeSetup, Fd)> {
-	match setup {
-		PipeSetup::FileName(name, mode) => {
-			let mut name = name.into_bytes();
-			name.push(0);
+const PIPES_INHERIT:   c_int = -2;
+const PIPES_PIPE:      c_int = -3;
+const PIPES_NULL:      c_int = -4;
+const PIPES_TO_STDOUT: c_int = -5;
+const PIPES_TO_STDERR: c_int = -6;
+const PIPES_TEMP:      c_int = -7;
 
-			let fd = match mode {
-				Mode::Read   => unsafe { open(cstr!(name), O_RDONLY) },
-				Mode::Write  => unsafe { open(cstr!(name), O_WRONLY | O_CREAT | O_TRUNC,  S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH) },
-				Mode::Append => unsafe { open(cstr!(name), O_WRONLY | O_CREAT | O_APPEND, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH) },
-			};
+fn pipes_close(child: &mut ChildIntern) -> c_int {
+	unsafe {
+		let mut status = 0;
 
-			if fd < 0 {
-				c_err!()
-			} else {
-				Ok((PipeSetup::FileDescr(fd), Fd { fd }))
+		if child.infd > -1 {
+			if close(child.infd) != 0 {
+				status = -1;
 			}
-		},
-		PipeSetup::File(file) => {
-			let fd = file.into_raw_fd();
-			Ok((PipeSetup::FileDescr(fd), Fd { fd }))
-		},
-		PipeSetup::FileDescr(fd) => Ok((setup, Fd { fd })),
-		_ => Ok((setup, Fd {fd: -1 }))
+			child.infd = -1;
+		}
+
+		if child.outfd > -1 {
+			if close(child.outfd) != 0 {
+				status = -1;
+			}
+			child.outfd = -1;
+		}
+
+		if child.errfd > -1 {
+			if close(child.errfd) != 0 {
+				status = -1;
+			}
+			child.errfd = -1;
+		}
+
+		return status;
 	}
 }
 
-fn redirect_stdout(stdout: &PipeSetup, fd: c_int) {
-	if stdout.is_redirect_to(Target::Stderr) {
-		if unsafe { dup2(STDERR_FILENO, STDOUT_FILENO) } == -1 {
-			unsafe {
-				perror(cstr!(b"redirecting stdout\0"));
-				exit(EXIT_FAILURE);
-			}
-		}
-	} else {
-		redirect_fd(fd, STDOUT_FILENO, cstr!(b"redirecting stdout\0"));
+fn handle_error(infd: c_int, outfd: c_int, errfd: c_int, child: &mut ChildIntern) -> Result<()> {
+	unsafe {
+		let errno = *__errno_location();
+
+		if infd  > -1 { close(infd); }
+		if outfd > -1 { close(outfd); }
+		if errfd > -1 { close(errfd); }
+
+		pipes_close(child);
+
+		return Err(Error::OS(errno));
 	}
 }
 
-fn redirect_stderr(stderr: &PipeSetup, fd: c_int) {
-	if stderr.is_redirect_to(Target::Stdout) {
-		if unsafe { dup2(STDOUT_FILENO, STDERR_FILENO) } == -1 {
-			unsafe {
-				perror(cstr!(b"redirecting stderr\0"));
-				exit(EXIT_FAILURE);
+fn pipes_open(argv: *const *const c_char, envp: *const *const c_char, child: &mut ChildIntern) -> Result<()> {
+	unsafe {
+		let mut infd  = -1;
+		let mut outfd = -1;
+		let mut errfd = -1;
+
+		let inaction  = child.infd;
+		let outaction = child.outfd;
+		let erraction = child.errfd;
+
+		match inaction {
+			::PIPES_PIPE => {
+				let mut pair: [c_int; 2] = [-1, -1];
+				if pipe(pair.as_mut_ptr()) == -1 {
+					return handle_error(infd, outfd, errfd, child);
+				}
+				infd = pair[0];
+				child.infd = pair[1];
+			},
+			::PIPES_NULL => {
+				infd = open(cstr!(b"/dev/null\0"), O_RDONLY);
+
+				if infd < 0 {
+					return handle_error(infd, outfd, errfd, child);
+				}
+			},
+			::PIPES_TEMP => {
+				infd = open_temp_fd();
+				child.infd = infd;
+
+				if infd < 0 {
+					return handle_error(infd, outfd, errfd, child);
+				}
+			},
+			::PIPES_INHERIT => {},
+			_ if inaction > -1 => {
+				infd = inaction;
+				child.infd = -1;
+			},
+			_ => {
+				*__errno_location() = EINVAL;
+				return handle_error(infd, outfd, errfd, child);
 			}
 		}
-	} else {
-		redirect_fd(fd, STDERR_FILENO, cstr!(b"redirecting stderr\0"));
+
+		match outaction {
+			::PIPES_PIPE => {
+				let mut pair: [c_int; 2] = [-1, -1];
+				if pipe(pair.as_mut_ptr()) == -1 {
+					return handle_error(infd, outfd, errfd, child);
+				}
+				outfd = pair[1];
+				child.outfd = pair[0];
+			},
+			::PIPES_NULL => {
+				outfd = open(cstr!(b"/dev/null\0"), O_RDONLY);
+
+				if outfd < 0 {
+					return handle_error(infd, outfd, errfd, child);
+				}
+			},
+			::PIPES_TO_STDERR => {},
+			::PIPES_TEMP => {
+				outfd = open_temp_fd();
+				child.outfd = outfd;
+
+				if outfd < 0 {
+					return handle_error(infd, outfd, errfd, child);
+				}
+			},
+			::PIPES_INHERIT => {},
+			_ if outaction > -1 => {
+				outfd = outaction;
+				child.outfd = -1;
+			},
+			_ => {
+				*__errno_location() = EINVAL;
+				return handle_error(infd, outfd, errfd, child);
+			}
+		}
+
+		match erraction {
+			::PIPES_PIPE => {
+				let mut pair: [c_int; 2] = [-1, -1];
+				if pipe(pair.as_mut_ptr()) == -1 {
+					return handle_error(infd, outfd, errfd, child);
+				}
+				errfd = pair[1];
+				child.errfd = pair[0];
+			},
+			::PIPES_NULL => {
+				errfd = open(cstr!(b"/dev/null\0"), O_RDONLY);
+
+				if errfd < 0 {
+					return handle_error(infd, outfd, errfd, child);
+				}
+			},
+			::PIPES_TO_STDOUT => {},
+			::PIPES_TEMP => {
+				errfd = open_temp_fd();
+				child.errfd = errfd;
+
+				if errfd < 0 {
+					return handle_error(infd, outfd, errfd, child);
+				}
+			},
+			::PIPES_INHERIT => {},
+			_ if erraction > -1 => {
+				errfd = erraction;
+				child.errfd = -1;
+			},
+			_ => {
+				*__errno_location() = EINVAL;
+				return handle_error(infd, outfd, errfd, child);
+			}
+		}
+
+		let pid = fork();
+
+		if pid == -1 {
+			return handle_error(infd, outfd, errfd, child);
+		}
+
+		if pid == 0 {
+			// child
+			redirect_fd(infd, STDIN_FILENO, cstr!(b"redirecting stdin\0"));
+
+			if outaction == PIPES_TO_STDERR {
+				if dup2(STDERR_FILENO, STDOUT_FILENO) == -1 {
+					perror(cstr!(b"redirecting stdout\0"));
+					exit(EXIT_FAILURE);
+				}
+			}
+			else {
+				redirect_fd(outfd, STDOUT_FILENO, cstr!(b"redirecting stdout\0"));
+			}
+
+			if erraction == PIPES_TO_STDOUT {
+				if dup2(STDOUT_FILENO, STDERR_FILENO) == -1 {
+					perror(cstr!(b"redirecting stderr\0"));
+					exit(EXIT_FAILURE);
+				}
+			}
+			else {
+				redirect_fd(errfd, STDERR_FILENO, cstr!(b"redirecting stderr\0"));
+			}
+
+			if envp != ptr::null() {
+				environ = envp;
+			}
+
+			if execvp(*argv, argv) == -1 {
+				perror(*argv);
+			}
+			exit(EXIT_FAILURE);
+		} else {
+			// parent
+			child.pid = pid;
+
+			if inaction  != PIPES_TEMP && infd  > -1 { close(infd); }
+			if outaction != PIPES_TEMP && outfd > -1 { close(outfd); }
+			if erraction != PIPES_TEMP && errfd > -1 { close(errfd); }
+		}
+
+		Ok(())
 	}
+}
+
+fn intern_wait(pid: pid_t) -> Result<c_int> {
+	if pid <= 0 {
+		return Err(Error::OS(ECHILD));
+	}
+
+	let mut status: c_int = -1;
+	if unsafe { waitpid(pid, &mut status, 0) } == -1 {
+		return c_err!();
+	}
+
+	if unsafe { WIFEXITED(status) } {
+		return Ok(unsafe { WEXITSTATUS(status) });
+	}
+
+	if unsafe { WIFSIGNALED(status) } {
+		return Err(Error::ChildSignaled(unsafe { WTERMSIG(status) }));
+	}
+
+	if unsafe { WCOREDUMP(status) } {
+		return Err(Error::ChildCoreDumped);
+	}
+
+	if unsafe { WIFSTOPPED(status) } {
+		return Err(Error::ChildStopped(unsafe { WSTOPSIG(status) }));
+	}
+
+	if unsafe { WIFCONTINUED(status) } {
+		return Err(Error::ChildContinued);
+	}
+
+	return Err(Error::OS(EINVAL));
+
 }
 
 impl Pipes {
-	fn empty() -> Self {
+	pub fn empty() -> Self {
 		Pipes {
 			stdin:  PipeSetup::Inherit,
 			stdout: PipeSetup::Inherit,
@@ -808,210 +971,6 @@ impl Pipes {
 		return true;
 	}
 
-	pub fn open(self) -> Result<Child> {
-		// imediately consume file descriptors so that they are closed
-		// by the Fd destructor in any case
-
-		// Opens named files/pulls file descriptors out of files and
-		// create handles that will close file descriptors on return
-		let stdin_setup  = convert_setup(self.stdin);
-		let stdout_setup = convert_setup(self.stdout);
-		let stderr_setup = convert_setup(self.stderr);
-
-		// Only now handle errors after all handles where created
-		let (stdin_setup,  mut infd)  = stdin_setup?;
-		let (stdout_setup, mut outfd) = stdout_setup?;
-		let (stderr_setup, mut errfd) = stderr_setup?;
-
-		if self.argv.len() == 0 {
-			return Err(Error::NotEnoughArguments);
-		}
-
-		let stdin = match stdin_setup {
-			PipeSetup::Inherit => None,
-			PipeSetup::Pipe => {
-				let mut pair: [c_int; 2] = [-1, -1];
-				if unsafe { pipe(pair.as_mut_ptr()) } == -1 {
-					return c_err!();
-				}
-				infd.fd = pair[0];
-				Some(unsafe { File::from_raw_fd(pair[1]) })
-			},
-			PipeSetup::Temp => {
-				infd.fd = open_temp_fd();
-				if infd.fd < 0 {
-					return c_err!();
-				}
-				None // see below
-			},
-			PipeSetup::Null => {
-				infd.fd = unsafe { open(cstr!(b"/dev/null\0"), O_RDONLY) };
-				if infd.fd == -1 {
-					return c_err!();
-				}
-				None
-			},
-			PipeSetup::Redirect(target) => {
-				return Err(Error::CannotRedirectStdinTo(target));
-			},
-			PipeSetup::FileName(_, _) | PipeSetup::FileDescr(_) | PipeSetup::File(_) => {
-				None // see fd_from_setup() and below after fork()
-			}
-		};
-
-		let stdout = match stdout_setup {
-			PipeSetup::Inherit => None,
-			PipeSetup::Pipe | PipeSetup::Redirect(Target::Stdout) => {
-				let mut pair: [c_int; 2] = [-1, -1];
-				if unsafe { pipe(pair.as_mut_ptr()) } == -1 {
-					return c_err!();
-				}
-				outfd.fd = pair[1];
-				Some(unsafe { File::from_raw_fd(pair[0]) })
-			},
-			PipeSetup::Temp => {
-				outfd.fd = open_temp_fd();
-				if outfd.fd < 0 {
-					return c_err!();
-				}
-				None // see below
-			},
-			PipeSetup::Null => {
-				outfd.fd = unsafe { open(cstr!(b"/dev/null\0"), O_WRONLY) };
-				if outfd.fd == -1 {
-					return c_err!();
-				}
-				None
-			},
-			PipeSetup::Redirect(Target::Stderr) | PipeSetup::FileName(_, _) | PipeSetup::FileDescr(_) | PipeSetup::File(_) => {
-				None // see fd_from_setup() and below after fork()
-			}
-		};
-
-		let stderr = match stderr_setup {
-			PipeSetup::Inherit | PipeSetup::Redirect(Target::Stderr) => None,
-			PipeSetup::Pipe => {
-				let mut pair: [c_int; 2] = [-1, -1];
-				if unsafe { pipe(pair.as_mut_ptr()) } == -1 {
-					return c_err!();
-				}
-				errfd.fd = pair[1];
-				Some(unsafe { File::from_raw_fd(pair[0]) })
-			},
-			PipeSetup::Temp => {
-				errfd.fd = open_temp_fd();
-				if errfd.fd < 0 {
-					return c_err!();
-				}
-				None // see below
-			},
-			PipeSetup::Null => {
-				errfd.fd = unsafe { open(cstr!(b"/dev/null\0"), O_WRONLY) };
-				if errfd.fd == -1 {
-					return c_err!();
-				}
-				None
-			},
-			PipeSetup::Redirect(Target::Stdout) | PipeSetup::FileName(_, _) | PipeSetup::FileDescr(_) | PipeSetup::File(_) => {
-				None // see fd_from_setup() and below after fork()
-			}
-		};
-
-		// doing malloc()ing stuff before fork()
-		let argv: Vec<Vec<u8>> = self.argv.iter().map(|arg| {
-			let mut bytes = arg.clone().into_bytes();
-			bytes.push(0);
-			bytes
-		}).collect();
-		let mut c_argv: Vec<*const c_char> = argv.iter().map(|arg| cstr!(arg[..])).collect();
-		c_argv.push(ptr::null());
-
-		let envp = if self.envp.is_empty() {
-			None
-		} else {
-			let mut envp = HashMap::<Vec<u8>, Vec<u8>>::new();
-			for (key, value) in env::vars() {
-				let key = key.into_bytes();
-				let value = value.into_bytes();
-
-				envp.insert(key, value);
-			}
-
-			for (key, value) in self.envp {
-				let key = key.into_bytes();
-				let value = value.into_bytes();
-
-				envp.insert(key, value);
-			}
-
-			let mut envp2 = Vec::<u8>::new();
-			let mut c_envp = Vec::<*const c_char>::with_capacity(envp.len());
-			for (key, value) in envp {
-				envp2.extend_from_slice(&key[..]);
-				envp2.push('=' as u8);
-				envp2.extend_from_slice(&value[..]);
-				envp2.push(0);
-			}
-
-			let mut index = 0;
-			let len = envp2.len();
-			while index < len {
-				if envp2[index] == 0 && index + 1 < len {
-					c_envp.push(cstr!(envp2[index + 1..]));
-				}
-				index += 1;
-			}
-			c_envp.push(ptr::null());
-
-			Some((envp2, c_envp))
-		};
-
-		let pid = unsafe { fork() };
-
-		if pid == -1 {
-			return c_err!();
-		}
-
-		if pid == 0 {
-			// child
-			redirect_fd(infd.fd, STDIN_FILENO, cstr!(b"redirecting stdin\0"));
-
-			if self.last == Target::Stderr {
-				redirect_stdout(&stdout_setup, outfd.fd);
-				redirect_stderr(&stderr_setup, errfd.fd);
-			} else {
-				redirect_stderr(&stderr_setup, errfd.fd);
-				redirect_stdout(&stdout_setup, outfd.fd);
-			}
-
-			if let Some((_, ref c_envp)) = envp {
-				unsafe { environ = (&c_envp[..]).as_ptr(); }
-			}
-
-			if unsafe { execvp(c_argv[0], (&c_argv[..]).as_ptr()) } == -1 {
-				unsafe { perror(c_argv[0]); }
-			}
-			unsafe { exit(EXIT_FAILURE); }
-		} else {
-			// parent
-			Ok(Child {
-				pid,
-
-				stdin: if stdin_setup.is_temp() {
-					Some(unsafe { File::from_raw_fd(infd.into_raw_fd()) })
-				} else { stdin },
-
-				stdout: if stdout_setup.is_temp() {
-					Some(unsafe { File::from_raw_fd(outfd.into_raw_fd()) })
-				} else { stdout },
-
-				stderr: if stderr_setup.is_temp() {
-					Some(unsafe { File::from_raw_fd(errfd.into_raw_fd()) })
-				} else { stderr }
-			})
-		}
-	}
-
 	pub fn env(&mut self, key: &str, value: &str) {
 		self.envp.insert(key.to_string(), value.to_string());
 	}
@@ -1040,98 +999,180 @@ impl Pipes {
 	}
 }
 
+fn make_ptr_array(buf: &Vec<u8>, len: usize) -> Vec<*const c_char> {
+	let mut ptrs = Vec::<*const c_char>::with_capacity(len);
+	let mut index = 0;
+	if buf[0] != 0 {
+		let len = buf.len();
+		ptrs.push(cstr!(buf[..]));
+		while index < len {
+			if buf[index] == 0 && index + 1 < len {
+				ptrs.push(cstr!(buf[index + 1..]));
+			}
+			index += 1;
+		}
+	}
+	ptrs.push(ptr::null());
+	ptrs
+}
+
+fn make_argv(argv: &Vec<String>) -> (Vec<u8>, Vec<*const c_char>) {
+	let mut buf = Vec::<u8>::new();
+	for arg in argv {
+		buf.extend_from_slice(arg.as_bytes());
+		buf.push(0);
+	}
+
+	let argv = make_ptr_array(&buf, argv.len());
+	(buf, argv)
+}
+
+fn make_envp(vars: &HashMap<String, String>) -> (Vec<u8>, Vec<*const c_char>) {
+	let mut envp = HashMap::<Vec<u8>, Vec<u8>>::new();
+	for (key, value) in env::vars() {
+		let key = key.into_bytes();
+		let value = value.into_bytes();
+		envp.insert(key, value);
+	}
+
+	for (key, value) in vars {
+		let key = key.clone().into_bytes();
+		let value = value.clone().into_bytes();
+
+		envp.insert(key, value);
+	}
+
+	let mut buf = Vec::<u8>::new();
+	let len = envp.len();
+	for (key, value) in envp {
+		buf.extend_from_slice(&key[..]);
+		buf.push('=' as u8);
+		buf.extend_from_slice(&value[..]);
+		buf.push(0);
+	}
+
+	let envp = make_ptr_array(&buf, len);
+	(buf, envp)
+}
+
 impl Chain {
-	pub fn open(mut pipes: Vec<Pipes>) -> Result<Self> {
+	pub fn kill(&mut self, sig: c_int) -> Result<()> {
+		for child in &self.children {
+			if unsafe { kill(child.pid, sig) } == -1 {
+				return c_err!();
+			}
+		}
+		Ok(())
+	}
+
+	pub fn new(pipes: Vec<Pipes>) -> Result<Self> {
 		let len = pipes.len();
 		if len == 0 {
 			return Err(Error::NotEnoughPipes);
 		}
 
-		let mut children = Vec::with_capacity(len);
-		let mut first = Pipes::empty();
-		swap(&mut first, &mut pipes[0]);
-		children.push( first.open()? );
+		let mut children = Vec::<ChildIntern>::with_capacity(len);
+		let mut index = 0;
+		for pipe in pipes {
+			let mut child = unsafe { ChildIntern {
+				pid: -1,
+				infd:  pipe.stdin.into_raw_fd(),
+				outfd: pipe.stdout.into_raw_fd(),
+				errfd: pipe.stderr.into_raw_fd()
+			}};
 
-		let mut i = 1;
-		while i < len {
-			let mut pipe = Pipes::empty();
-			swap(&mut pipe, &mut pipes[i]);
-
-			if pipe.stdin.is_pipe() {
-				let stdin = match &children[i - 1].stdout {
-					Some(ref stdout) => PipeSetup::FileDescr(stdout.as_raw_fd()),
-					None => PipeSetup::Null
-				};
-				children.push( Pipes {
-					stdin:  stdin,
-					stdout: pipe.stdout,
-					stderr: pipe.stderr,
-					last: pipe.last,
-					argv: pipe.argv,
-					envp: pipe.envp
-				}.open()? );
-			} else {
-				children.push( pipe.open()? );
+			if child.outfd == PIPES_TO_STDOUT {
+				child.outfd = PIPES_PIPE;
 			}
 
-			i += 1;
+			if child.errfd == PIPES_TO_STDERR {
+				child.errfd = PIPES_PIPE;
+			}
+
+			if index > 0 && child.infd == PIPES_PIPE {
+				let prevfd = children[index - 1].outfd;
+				if prevfd >= 0 {
+					child.infd = prevfd;
+					children[index - 1].outfd = -1;
+				} else {
+					child.infd = PIPES_INHERIT;
+				}
+			}
+
+			let (argvbuf, argv) = make_argv(&pipe.argv);
+			let (envpbuf, envp) = make_envp(&pipe.envp);
+
+			let res = pipes_open((&argv[..]).as_ptr(), (&envp[..]).as_ptr(), &mut child);
+
+			// I hope these explicit drops ensure the lifetime of the buffers
+			// until this point, even with non-lexical lifetimes.
+			drop(argvbuf);
+			drop(envpbuf);
+
+			if !res.is_ok() {
+				for mut child in &mut children {
+					unsafe { kill(child.pid, SIGTERM); }
+					pipes_close(&mut child);
+				}
+				res?;
+			}
+
+			children.push(child);
+			index += 1;
 		}
 
-		Ok(Chain { children: children })
+		Ok(Chain { children })
 	}
 
-	pub fn kill(&mut self, sig: c_int) {
-		for ref mut child in &mut self.children {
-			match child.kill(sig) { _ => {} };
+	pub fn stdin(&mut self) -> Option<File> {
+		let fd = self.children[0].infd;
+		if fd < 0 {
+			return None;
 		}
+		self.children[0].infd = -1;
+		Some(unsafe { File::from_raw_fd(fd) })
 	}
 
-	pub fn stdin(&mut self) -> Option<&mut File> {
-		match &mut self.children[0].stdin {
-			Some(ref mut stdin) => Some(stdin),
-			None => None
-		}
-	}
-
-	pub fn stdout(&mut self) -> Option<&mut File> {
+	pub fn stdout(&mut self) -> Option<File> {
 		let index = self.children.len() - 1;
-		match &mut self.children[index].stdout {
-			Some(ref mut stdout) => Some(stdout),
-			None => None
+		let fd = self.children[index].outfd;
+		if fd < 0 {
+			return None;
 		}
+		self.children[index].outfd = -1;
+		Some(unsafe { File::from_raw_fd(fd) })
 	}
 
-	pub fn stderr(&mut self) -> Option<&mut File> {
+	pub fn stderr(&mut self) -> Option<File> {
 		let index = self.children.len() - 1;
-		match &mut self.children[index].stderr {
-			Some(ref mut stderr) => Some(stderr),
-			None => None
+		let fd = self.children[index].errfd;
+		if fd < 0 {
+			return None;
 		}
+		self.children[index].errfd = -1;
+		Some(unsafe { File::from_raw_fd(fd) })
 	}
 
 	pub fn wait_all(&mut self) -> Vec<Result<c_int>> {
-		self.children.iter_mut().map(|child| child.wait()).collect()
+		self.children.iter().map(|child| intern_wait(child.pid)).collect()
 	}
 
 	pub fn wait_last(&mut self) -> Result<c_int> {
 		let index = self.children.len() - 1;
-		self.children[index].wait()
+		intern_wait(self.children[index].pid)
 	}
 
 	pub fn output(mut self) -> Result<Output> {
-		//println!("XXXXXXXXXX output()");
-		drop(self.children[0].stdin.take());
+		drop(self.stdin());
 
-		let index = self.children.len() - 1;
 		let mut stdout = Vec::new();
 		let mut stderr = Vec::new();
-		match (self.children[index].stdout.take(), self.children[index].stderr.take()) {
+		match (self.stdout(), self.stderr()) {
 			(None, None) => {},
 			(Some(mut out), None) => {
 				match out.read_to_end(&mut stdout) {
 					Ok(_) => {},
 					Err(err) => {
-						//println!("XXXXXXXXXX READ ERROR stdin");
 						return Err(Error::IO(err));
 					}
 				}
@@ -1140,7 +1181,6 @@ impl Chain {
 				match err.read_to_end(&mut stdout) {
 					Ok(_) => {},
 					Err(err) => {
-						//println!("XXXXXXXXXX READ ERROR stderr");
 						return Err(Error::IO(err));
 					}
 				}
@@ -1164,7 +1204,6 @@ impl Chain {
 					let res = unsafe { poll(pollfds.as_mut_ptr(), 2, -1) };
 
 					if res < 0 {
-						//println!("XXXXXXXXXX POLL ERROR");
 						return c_err!();
 					}
 
@@ -1174,7 +1213,6 @@ impl Chain {
 								stdout.extend_from_slice(&mut buf[..size]);
 							},
 							Err(err) => {
-								//println!("XXXXXXXXXX POLL READ ERROR stdout");
 								return Err(Error::IO(err));
 							}
 						}
@@ -1195,7 +1233,6 @@ impl Chain {
 								stderr.extend_from_slice(&mut buf[..size]);
 							},
 							Err(err) => {
-								//println!("XXXXXXXXXX POLL READ ERROR stdout");
 								return Err(Error::IO(err));
 							}
 						}
@@ -1216,11 +1253,19 @@ impl Chain {
 			}
 		}
 
-		let status = self.children[index].wait()?;
+		let status = self.wait_last()?;
 		Ok(Output {
 			status,
 			stdout,
 			stderr,
 		})
+	}
+}
+
+impl Drop for Chain {
+	fn drop(&mut self) {
+		for mut child in &mut self.children {
+			pipes_close(child);
+		}
 	}
 }
