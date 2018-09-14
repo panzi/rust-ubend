@@ -605,6 +605,14 @@ fn redirect_fd(oldfd: c_int, newfd: c_int, errmsg: *const c_char) {
 	}
 }
 
+fn redirect_out_fd(action: c_int, oldfd: c_int, newfd: c_int, errmsg: *const c_char) {
+	match action {
+		::PIPES_TO_STDOUT => redirect_fd(STDOUT_FILENO, newfd, errmsg),
+		::PIPES_TO_STDERR => redirect_fd(STDERR_FILENO, newfd, errmsg),
+		_                 => redirect_fd(oldfd, newfd, errmsg),
+	}
+}
+
 const PIPES_INHERIT:   c_int = -2;
 const PIPES_PIPE:      c_int = -3;
 const PIPES_NULL:      c_int = -4;
@@ -655,7 +663,7 @@ fn handle_error(infd: c_int, outfd: c_int, errfd: c_int, child: &mut ChildIntern
 	}
 }
 
-fn pipes_open(argv: *const *const c_char, envp: *const *const c_char, child: &mut ChildIntern) -> Result<()> {
+fn pipes_open(argv: *const *const c_char, envp: *const *const c_char, child: &mut ChildIntern, last: Target) -> Result<()> {
 	unsafe {
 		let mut infd  = -1;
 		let mut outfd = -1;
@@ -782,24 +790,12 @@ fn pipes_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 			// child
 			redirect_fd(infd, STDIN_FILENO, cstr!(b"redirecting stdin\0"));
 
-			if outaction == PIPES_TO_STDERR {
-				if dup2(STDERR_FILENO, STDOUT_FILENO) == -1 {
-					perror(cstr!(b"redirecting stdout\0"));
-					exit(EXIT_FAILURE);
-				}
-			}
-			else {
-				redirect_fd(outfd, STDOUT_FILENO, cstr!(b"redirecting stdout\0"));
-			}
-
-			if erraction == PIPES_TO_STDOUT {
-				if dup2(STDOUT_FILENO, STDERR_FILENO) == -1 {
-					perror(cstr!(b"redirecting stderr\0"));
-					exit(EXIT_FAILURE);
-				}
-			}
-			else {
-				redirect_fd(errfd, STDERR_FILENO, cstr!(b"redirecting stderr\0"));
+			if last == Target::Stderr {
+				redirect_out_fd(outaction, outfd, STDOUT_FILENO, cstr!(b"redirecting stdout\0"));
+				redirect_out_fd(erraction, errfd, STDERR_FILENO, cstr!(b"redirecting stderr\0"));
+			} else {
+				redirect_out_fd(erraction, errfd, STDERR_FILENO, cstr!(b"redirecting stderr\0"));
+				redirect_out_fd(outaction, outfd, STDOUT_FILENO, cstr!(b"redirecting stdout\0"));
 			}
 
 			if envp != ptr::null() {
@@ -1102,7 +1098,7 @@ impl Chain {
 			let (argvbuf, argv) = make_argv(&pipe.argv);
 			let (envpbuf, envp) = make_envp(&pipe.envp);
 
-			let res = pipes_open((&argv[..]).as_ptr(), (&envp[..]).as_ptr(), &mut child);
+			let res = pipes_open((&argv[..]).as_ptr(), (&envp[..]).as_ptr(), &mut child, pipe.last);
 
 			// I hope these explicit drops ensure the lifetime of the buffers
 			// until this point, even with non-lexical lifetimes.
