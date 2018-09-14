@@ -1075,6 +1075,33 @@ impl Chain {
 			return Err(Error::NotEnoughPipes);
 		}
 
+		let mut prev_was_pipe = true;
+		for pipe in &pipes {
+			if pipe.argv.is_empty() {
+				return Err(Error::NotEnoughArguments);
+			}
+
+			match pipe.stdin {
+				PipeSetup::Redirect(target) => {
+					return Err(Error::CannotRedirectStdinTo(target));
+				},
+				PipeSetup::Pipe => {
+					if !prev_was_pipe {
+						return Err(Error::InvalidPipeLinkup);
+					}
+				},
+				_ => {}
+			}
+
+			prev_was_pipe = match pipe.stdout {
+				PipeSetup::Pipe | PipeSetup::Redirect(Target::Stdout) => true,
+				_ => match pipe.stderr {
+					PipeSetup::Redirect(Target::Stdout) => true,
+					_ => false
+				}
+			};
+		}
+
 		let mut children = Vec::<ChildIntern>::with_capacity(len);
 		let mut index = 0;
 		for pipe in pipes {
