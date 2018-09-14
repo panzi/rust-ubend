@@ -41,15 +41,6 @@ macro_rules! assert_output {
 
 macro_rules! assert_wait {
 	($chain:expr) => {
-		/*
-		for (index, status) in ($chain).wait_all().iter().enumerate() {
-			let status = match status {
-				Ok(status) => *status,
-				Err(err) => panic!("wait for child {} failed: {}", index, err)
-			};
-			assert_eq!(status, 0, "checking exit status of child {}", index);
-		}
-		*/
 		let status = match $chain.wait_last() {
 			Ok(status) => status,
 			Err(err) => panic!("wait for last child failed: {}", err)
@@ -77,7 +68,6 @@ fn remove_output_file(name: &str) {
 	}
 }
 
-// FIXME: there are weird random crashes where I have no idea what's happening
 #[test]
 fn stdio() {
 	assert_output!(
@@ -153,17 +143,4 @@ fn setenv() {
 	assert_output!(
 		spawn!(FOO="BAR" "./tests/getenv.sh" "FOO"),
 		"BAR\n");
-
 }
-
-// TODO: write tests, fix bugs
-/*
-fn main() {
-	stdio();
-	read_and_write_file_by_name();
-	write_file_by_handle();
-	read_file_by_handle();
-	append();
-	setenv();
-}
-*/
