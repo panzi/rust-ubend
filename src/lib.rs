@@ -1,3 +1,79 @@
+//! # Pipes
+//!
+//! This is a small crate that lets you build pipe chains between spawned
+//! processes using a syntax similar to the Unix shell.
+//!
+//! ```
+//! # #[macro_use] extern crate pipes;
+//! # use pipes::IntoPipeSetup;
+//! 
+//! let output = spawn!(
+//! 		cat <"./tests/input.txt" |
+//! 		grep "spam" |
+//! 		wc "-l"
+//! 	).expect("spawn failed").
+//! 	output().
+//! 	expect("reading output failed").
+//! 	stdout;
+//! 
+//! let output = String::from_utf8(output).
+//! 	expect("UTF-8 error").
+//! 	trim().
+//! 	parse::<i64>().
+//! 	unwrap();
+//! 
+//! println!("output: {}", output);
+//! ```
+//! 
+//! Note that arguments to commands need always to be quoted. If you don't quote
+//! them they are interpreted as Rust identifiers which allows you to pass
+//! dynamic strings. Also `FOO="bar" cat <"baz"` is the same as
+//! `FOO = "bar" cat < "baz"`, since whitespace is ignored in Rust.
+//! 
+//! `use pipes::IntoPipeSetup` is needed when passing a file name or
+//! `std::fs::File` as redirection source/target.
+//! 
+//! **Note:** Currently only Linux ist tested. Other Unix operating systems might
+//! work, too. Windows support is not implemented.
+//! 
+//! ## More Examples
+//! 
+//! ```
+//! # #[macro_use] extern crate pipes;
+//! # use pipes::IntoPipeSetup;
+//! # use std::fs::File;
+//! # use std::io::{Read, Seek, SeekFrom};
+//! use pipes::PipeSetup::*;
+//! 
+//! // Ignore stderr
+//! spawn!(rm "no_such_file" 2>Null);
+//! 
+//! // Redirect stderr to stdout
+//! spawn!(rm "no_such_file" 2>&1);
+//! 
+//! // Write stderr to stderr of this process
+//! spawn!(rm "no_such_file" 2>Inherit);
+//! 
+//! // Read from a file opened in Rust
+//! let file = File::open("./tests/input.txt").
+//! 	expect("couldn't open file");
+//! spawn!(grep "spam" <file);
+//! 
+//! // Write stderr to a temp file
+//! let mut chain = spawn!(rm "no_such_file" 2>Temp).
+//! 	expect("spawn failed");
+//! 
+//! chain.wait_last().
+//! 	expect("wait failed");
+//! 
+//! let mut temp = chain.stderr().unwrap();
+//! 
+//! // Since the file descriptor was shared with the spawned process the
+//! // position needs to be reset manually:
+//! temp.seek(SeekFrom::Start(0)).
+//! 	expect("seek failed");
+//! ```
+
 extern crate libc;
 
 use std::vec::Vec;
@@ -55,6 +131,7 @@ use libc::{
 	ENOENT,
 	ECHILD,
 	EINVAL,
+	EINTR,
 	EXIT_FAILURE,
 	STDIN_FILENO,
 	STDOUT_FILENO,
@@ -88,12 +165,14 @@ macro_rules! cstr {
 	}
 }
 
+/// Redirection target. Used with [PipeSetup].
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum Target {
 	Stdout,
 	Stderr
 }
 
+/// File open mode. Used with [PipeSetup].
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum Mode {
 	Read,
@@ -101,15 +180,46 @@ pub enum Mode {
 	Append
 }
 
+/// Setup a pipe.
 #[derive(Debug)]
 pub enum PipeSetup {
+	/// Inherit the stream from the parent process. This is the default for
+	/// stderr and for stdin of the first process in the pipe chain.
 	Inherit,
+
+	/// Open a pipe to the parent process or between processes. This is the
+	/// default for stdout and for stdin of all but the first process in the
+	/// pipe chain.
 	Pipe,
+
+	/// Open a pipe to `/dev/null`.
 	Null,
+
+	/// Redirect this stream to the specified target stream. Only stdout and
+	/// stderr can be redirected this way and only to each other. If a stream
+	/// is redirected to itself it is equivalent to [PipeSetup::Pipe].
 	Redirect(Target),
+
+	/// Connect the stream to a temp file. If supported this is done via the
+	/// operating systems native temp file support using the `O_TMPFILE` flag.
+	/// Such a file is written to the hard disk, but has no name and will be
+	/// deleted after the file handle to it is closed.
+	///
+	/// If the operating system or filesystem of `/tmp` does not support the
+	/// `O_TMPFILE` flag the same behaviour is emulated by opening a new file
+	/// using `mkstemp()` and then immediately `unlink()`ed.
 	Temp,
+
+	/// Connect the stream to the specified file descriptor. Note that error
+	/// or not any passed file descriptor will be consumed (closed) by
+	/// [Chain::new()].
 	FileDescr(c_int),
+
+	/// Connect the stream to the specified file using the specified mode.
 	FileName(String, Mode),
+
+	/// Connect the stream to the specified file. Note that error or not any
+	/// passed file will be consumed (closed) by [Chain::new()].
 	File(File)
 }
 
@@ -210,6 +320,7 @@ impl PipeSetup {
 	}
 }
 
+/// Configuration of a child process.
 #[derive(Debug)]
 pub struct Pipes {
 	pub stdin:  PipeSetup,
@@ -228,26 +339,50 @@ struct ChildIntern {
 	errfd: c_int,
 }
 
+/// Represents a pipe chain.
 #[derive(Debug)]
 pub struct Chain {
 	children: Vec<ChildIntern>
 }
 
-// TODO: Split up and only declare the errors for a function
-//       that can really be really returned by said function.
 pub enum Error {
+	/// A libc function returned an error of specified `errno`.
 	OS(c_int),
-	IO(std::io::Error),
+
+	/// Any command needs to have at least one "argument" (the command name).
+	NotEnoughArguments,
+
+	/// stdin cannot be redirected to stderr or stdout, since those are output
+	/// streams and stdin is an input stream.
+	CannotRedirectStdinTo(Target),
+
+	/// A pipe chain has to have at least one command.
+	NotEnoughPipes,
+
+	/// If stdin of a child process is marked as `PipeSetup::Pipe` then stdout
+	/// of the previous process in the chain has to be `PipeSetup::Pipe` or
+	/// `PipeSetup::Redirect(Target::Stdout)` or stderr of that previous
+	/// process has to be `PipeSetup::Redirect(Target::Stdout)`.
+	InvalidPipeLinkup
+}
+
+pub enum WaitError {
+	Interrupted,
+	ChildInvalid,
 	ChildSignaled(c_int),
 	ChildCoreDumped,
 	ChildStopped(c_int),
 	ChildContinued,
-	NotEnoughArguments,
-	CannotRedirectStdinTo(Target),
-	NotEnoughPipes,
-	InvalidPipeLinkup
 }
 
+pub enum OutputError {
+	/// A Rust io function returned the specified error.
+	IO(std::io::Error),
+	Pipe(Error),
+	Wait(WaitError)
+}
+
+/// Output and exit status of the last process in the chain.
 pub struct Output {
 	pub status: c_int,
 	pub stdout: Vec<u8>,
@@ -255,6 +390,8 @@ pub struct Output {
 }
 
 pub type Result<T> = result::Result<T, Error>;
+
+pub type WaitResult = result::Result<c_int, WaitError>;
 
 pub trait IntoPipeSetup {
 	fn into_pipe_setup(self, mode: Mode) -> PipeSetup;
@@ -344,21 +481,51 @@ impl Display for Error {
 	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
 		match self {
 			Error::OS(errno) => fmt_os_error(*errno, f),
-			Error::IO(err) => err.fmt(f),
 			Error::NotEnoughArguments => f.write_str("not enough arguments (need at least one)"),
 			Error::CannotRedirectStdinTo(Target::Stdout) => f.write_str("cannot redirect stdin to stdout"),
 			Error::CannotRedirectStdinTo(Target::Stderr) => f.write_str("cannot redirect stdin to stderr"),
 			Error::NotEnoughPipes => f.write_str("not enough pipes (need at least one)"),
 			Error::InvalidPipeLinkup => f.write_str("invalid pipe linkup"),
-			Error::ChildSignaled(sig) => write!(f, "child exited with signal: {}", sig),
-			Error::ChildCoreDumped => f.write_str("child core dumped"),
-			Error::ChildStopped(sig) => write!(f, "child stopped with signal: {}", sig),
-			Error::ChildContinued => f.write_str("child continued"),
+		}
+	}
+}
+
+impl Display for WaitError {
+	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
+		match self {
+			WaitError::Interrupted => write!(f, "wait was interrupted"),
+			WaitError::ChildInvalid => write!(f, "process does not exist or is not a child of calling process"),
+			WaitError::ChildSignaled(sig) => write!(f, "child exited with signal: {}", sig),
+			WaitError::ChildCoreDumped => f.write_str("child core dumped"),
+			WaitError::ChildStopped(sig) => write!(f, "child stopped with signal: {}", sig),
+			WaitError::ChildContinued => f.write_str("child continued"),
+		}
+	}
+}
+
+impl Display for OutputError {
+	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
+		match self {
+			OutputError::IO(err)   => err.fmt(f),
+			OutputError::Pipe(err) => err.fmt(f),
+			OutputError::Wait(err) => err.fmt(f)
 		}
 	}
 }
 
 impl std::fmt::Debug for Error {
+	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
+		(self as &Display).fmt(f)
+	}
+}
+
+impl std::fmt::Debug for WaitError {
+	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
+		(self as &Display).fmt(f)
+	}
+}
+
+impl std::fmt::Debug for OutputError {
 	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
 		(self as &Display).fmt(f)
 	}
@@ -565,6 +732,7 @@ macro_rules! spawn_internal {
 	};
 }
 
+/// Create a pipe chain using a Unix shell like syntax.
 #[macro_export]
 macro_rules! spawn {
 	($($tt:tt)*) => {
@@ -832,14 +1000,18 @@ fn pipes_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 	}
 }
 
-fn intern_wait(pid: pid_t) -> Result<c_int> {
+fn intern_wait(pid: pid_t) -> WaitResult {
 	if pid <= 0 {
-		return Err(Error::OS(ECHILD));
+		return Err(WaitError::ChildInvalid);
 	}
 
 	let mut status: c_int = -1;
 	if unsafe { waitpid(pid, &mut status, 0) } == -1 {
-		return c_err!();
+		return Err(match unsafe { *__errno_location() } {
+			::ECHILD => WaitError::ChildInvalid,
+			::EINTR => WaitError::Interrupted,
+			errno => panic!("unhandled errno: {}", errno)
+		});
 	}
 
 	if unsafe { WIFEXITED(status) } {
@@ -847,22 +1019,22 @@ fn intern_wait(pid: pid_t) -> Result<c_int> {
 	}
 
 	if unsafe { WIFSIGNALED(status) } {
-		return Err(Error::ChildSignaled(unsafe { WTERMSIG(status) }));
+		return Err(WaitError::ChildSignaled(unsafe { WTERMSIG(status) }));
 	}
 
 	if unsafe { WCOREDUMP(status) } {
-		return Err(Error::ChildCoreDumped);
+		return Err(WaitError::ChildCoreDumped);
 	}
 
 	if unsafe { WIFSTOPPED(status) } {
-		return Err(Error::ChildStopped(unsafe { WSTOPSIG(status) }));
+		return Err(WaitError::ChildStopped(unsafe { WSTOPSIG(status) }));
 	}
 
 	if unsafe { WIFCONTINUED(status) } {
-		return Err(Error::ChildContinued);
+		return Err(WaitError::ChildContinued);
 	}
 
-	return Err(Error::OS(EINVAL));
+	return Err(WaitError::ChildInvalid);
 
 }
 
@@ -1065,6 +1237,7 @@ fn make_envp(vars: &HashMap<String, String>) -> (Vec<u8>, Vec<*const c_char>) {
 }
 
 impl Chain {
+	/// Send signal `sig` to all child processes.
 	pub fn kill(&mut self, sig: c_int) -> Result<()> {
 		for child in &self.children {
 			if unsafe { kill(child.pid, sig) } == -1 {
@@ -1074,6 +1247,7 @@ impl Chain {
 		Ok(())
 	}
 
+	/// Create a new pipe chain. This function is called by the [spawn!] macro.
 	pub fn new(pipes: Vec<Pipes>) -> Result<Self> {
 		let len = pipes.len();
 		if len == 0 {
@@ -1145,7 +1319,7 @@ impl Chain {
 			drop(argvbuf);
 			drop(envpbuf);
 
-			if !res.is_ok() {
+			if res.is_err() {
 				for mut child in &mut children {
 					unsafe { kill(child.pid, SIGTERM); }
 					pipes_close(&mut child);
@@ -1160,6 +1334,7 @@ impl Chain {
 		Ok(Chain { children })
 	}
 
+	/// Take ownership of stdin of the first process in the chain.
 	pub fn stdin(&mut self) -> Option<File> {
 		let fd = self.children[0].infd;
 		if fd < 0 {
@@ -1169,6 +1344,7 @@ impl Chain {
 		Some(unsafe { File::from_raw_fd(fd) })
 	}
 
+	/// Take ownership of stdout of the last process in the chain.
 	pub fn stdout(&mut self) -> Option<File> {
 		let index = self.children.len() - 1;
 		let fd = self.children[index].outfd;
@@ -1179,6 +1355,7 @@ impl Chain {
 		Some(unsafe { File::from_raw_fd(fd) })
 	}
 
+	/// Take ownership of stderr of the last process in the chain.
 	pub fn stderr(&mut self) -> Option<File> {
 		let index = self.children.len() - 1;
 		let fd = self.children[index].errfd;
@@ -1189,16 +1366,21 @@ impl Chain {
 		Some(unsafe { File::from_raw_fd(fd) })
 	}
 
-	pub fn wait_all(&mut self) -> Vec<Result<c_int>> {
+	/// Wait for all child processes to finish.
+	pub fn wait_all(&mut self) -> Vec<WaitResult> {
 		self.children.iter().map(|child| intern_wait(child.pid)).collect()
 	}
 
-	pub fn wait_last(&mut self) -> Result<c_int> {
+	/// Wait for the last child process to finish.
+	pub fn wait_last(&mut self) -> WaitResult {
 		let index = self.children.len() - 1;
 		intern_wait(self.children[index].pid)
 	}
 
-	pub fn output(mut self) -> Result<Output> {
+	/// Close stdin of the first child process and read stdout and stderr
+	/// of the last child process (if possible) and wait for the last
+	/// child process to finish.
+	pub fn output(mut self) -> result::Result<Output, OutputError> {
 		drop(self.stdin());
 
 		let mut stdout = Vec::new();
@@ -1209,7 +1391,7 @@ impl Chain {
 				match out.read_to_end(&mut stdout) {
 					Ok(_) => {},
 					Err(err) => {
-						return Err(Error::IO(err));
+						return Err(OutputError::IO(err));
 					}
 				}
 			},
@@ -1217,7 +1399,7 @@ impl Chain {
 				match err.read_to_end(&mut stdout) {
 					Ok(_) => {},
 					Err(err) => {
-						return Err(Error::IO(err));
+						return Err(OutputError::IO(err));
 					}
 				}
 			},
@@ -1240,7 +1422,7 @@ impl Chain {
 					let res = unsafe { poll(pollfds.as_mut_ptr(), 2, -1) };
 
 					if res < 0 {
-						return c_err!();
+						return Err(OutputError::Pipe(Error::OS(unsafe { *__errno_location() })));
 					}
 
 					if pollfds[0].revents & POLLIN != 0 {
@@ -1249,7 +1431,7 @@ impl Chain {
 								stdout.extend_from_slice(&mut buf[..size]);
 							},
 							Err(err) => {
-								return Err(Error::IO(err));
+								return Err(OutputError::IO(err));
 							}
 						}
 					}
@@ -1260,7 +1442,7 @@ impl Chain {
 					}
 
 					if pollfds[0].revents & POLLNVAL != 0 {
-						return c_err!();
+						return Err(OutputError::Pipe(Error::OS(unsafe { *__errno_location() })));
 					}
 
 					if pollfds[1].revents & POLLIN != 0 {
@@ -1269,7 +1451,7 @@ impl Chain {
 								stderr.extend_from_slice(&mut buf[..size]);
 							},
 							Err(err) => {
-								return Err(Error::IO(err));
+								return Err(OutputError::IO(err));
 							}
 						}
 					}
@@ -1280,7 +1462,7 @@ impl Chain {
 					}
 
 					if pollfds[1].revents & POLLNVAL != 0 {
-						return c_err!();
+						return Err(OutputError::Pipe(Error::OS(unsafe { *__errno_location() })));
 					}
 
 					pollfds[0].revents = 0;
@@ -1289,12 +1471,14 @@ impl Chain {
 			}
 		}
 
-		let status = self.wait_last()?;
-		Ok(Output {
-			status,
-			stdout,
-			stderr,
-		})
+		match self.wait_last() {
+			Err(err) => Err(OutputError::Wait(err)),
+			Ok(status) => Ok(Output {
+				status,
+				stdout,
+				stderr,
+			})
+		}
 	}
 }
 
