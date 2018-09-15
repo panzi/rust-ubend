@@ -2,6 +2,7 @@
 
 set -e
 
+rm -r target/doc
 cargo doc --no-deps
 git checkout gh-pages
 rm -rv *.woff *.svg *.js *.txt *.css src/ubend implementors ubend
