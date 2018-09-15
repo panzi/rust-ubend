@@ -41,11 +41,12 @@ work, too. Windows support is not implemented.
 ## More Examples
 
 ```rust
-# #[macro_use] extern crate ubend;
-# use ubend::IntoPipeSetup;
-# use std::fs::File;
-# use std::io::{Read, Seek, SeekFrom};
+#[macro_use] extern crate ubend;
+use ubend::IntoPipeSetup;
 use ubend::PipeSetup::*;
+
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 
 // Ignore stderr
 spawn!(rm "no_such_file" 2>Null);
