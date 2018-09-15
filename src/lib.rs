@@ -132,6 +132,8 @@ use libc::{
 	ECHILD,
 	EINVAL,
 	EINTR,
+	EPERM,
+	ESRCH,
 	EXIT_FAILURE,
 	STDIN_FILENO,
 	STDOUT_FILENO,
@@ -332,7 +334,7 @@ pub struct Pipes {
 }
 
 #[derive(Debug)]
-struct Child {
+pub struct Child {
 	pid:   pid_t,
 	infd:  c_int,
 	outfd: c_int,
@@ -380,6 +382,12 @@ pub enum OutputError {
 	IO(std::io::Error),
 	Pipe(Error),
 	Wait(WaitError)
+}
+
+pub enum KillError {
+	InvalidSignal,
+	NoPermissions,
+	InvalidProcess
 }
 
 /// Output and exit status of the last process in the chain.
@@ -430,12 +438,6 @@ impl<'a> IntoPipeSetup for &'a String {
 impl IntoPipeSetup for File {
 	fn into_pipe_setup(self, _mode: Mode) -> PipeSetup {
 		PipeSetup::File(self)
-	}
-}
-
-macro_rules! c_err {
-	() => {
-		Err(Error::OS(unsafe { *__errno_location() }))
 	}
 }
 
@@ -493,8 +495,8 @@ impl Display for Error {
 impl Display for WaitError {
 	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
 		match self {
-			WaitError::Interrupted => write!(f, "wait was interrupted"),
-			WaitError::ChildInvalid => write!(f, "process does not exist or is not a child of calling process"),
+			WaitError::Interrupted => f.write_str("wait was interrupted"),
+			WaitError::ChildInvalid => f.write_str("process does not exist or is not a child of calling process"),
 			WaitError::ChildSignaled(sig) => write!(f, "child exited with signal: {}", sig),
 			WaitError::ChildCoreDumped => f.write_str("child core dumped"),
 			WaitError::ChildStopped(sig) => write!(f, "child stopped with signal: {}", sig),
@@ -513,6 +515,16 @@ impl Display for OutputError {
 	}
 }
 
+impl Display for KillError {
+	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
+		match self {
+			KillError::InvalidSignal => f.write_str("invalid signal"),
+			KillError::NoPermissions => f.write_str("no permissions to send signal to process"),
+			KillError::InvalidProcess => f.write_str("no such process")
+		}
+	}
+}
+
 impl std::fmt::Debug for Error {
 	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
 		(self as &Display).fmt(f)
@@ -526,6 +538,12 @@ impl std::fmt::Debug for WaitError {
 }
 
 impl std::fmt::Debug for OutputError {
+	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
+		(self as &Display).fmt(f)
+	}
+}
+
+impl std::fmt::Debug for KillError {
 	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
 		(self as &Display).fmt(f)
 	}
@@ -801,6 +819,102 @@ const PIPES_TO_STDOUT: c_int = -5;
 const PIPES_TO_STDERR: c_int = -6;
 const PIPES_TEMP:      c_int = -7;
 
+impl Child {
+	pub fn kill(&mut self, sig: c_int) -> result::Result<(), KillError> {
+		if unsafe { kill(self.pid, sig) } == -1 {
+			return match unsafe { *__errno_location() } {
+				::EINVAL => Err(KillError::InvalidSignal),
+				::EPERM  => Err(KillError::NoPermissions),
+				::ESRCH  => Err(KillError::InvalidProcess),
+				errno => panic!("unhandeled errno: {}", errno)
+			}
+		}
+		Ok(())
+	}
+
+	pub fn wait(&mut self) -> WaitResult {
+		if self.pid <= 0 {
+			return Err(WaitError::ChildInvalid);
+		}
+
+		let mut status: c_int = -1;
+		if unsafe { waitpid(self.pid, &mut status, 0) } == -1 {
+			return Err(match unsafe { *__errno_location() } {
+				::ECHILD => WaitError::ChildInvalid,
+				::EINTR => WaitError::Interrupted,
+				errno => panic!("unhandled errno: {}", errno)
+			});
+		}
+
+		self.pid = -1;
+
+		if unsafe { WIFEXITED(status) } {
+			return Ok(unsafe { WEXITSTATUS(status) });
+		}
+
+		if unsafe { WIFSIGNALED(status) } {
+			return Err(WaitError::ChildSignaled(unsafe { WTERMSIG(status) }));
+		}
+
+		if unsafe { WCOREDUMP(status) } {
+			return Err(WaitError::ChildCoreDumped);
+		}
+
+		if unsafe { WIFSTOPPED(status) } {
+			return Err(WaitError::ChildStopped(unsafe { WSTOPSIG(status) }));
+		}
+
+		if unsafe { WIFCONTINUED(status) } {
+			return Err(WaitError::ChildContinued);
+		}
+
+		return Err(WaitError::ChildInvalid);
+	}
+
+	pub fn pid(&self) -> pid_t {
+		self.pid
+	}
+
+	/// Take ownership of stdin of the process.
+	///
+	/// If the setup didn't create a pipe for stdin or the pipe was already
+	// taken this function returns None.
+	pub fn stdin(&mut self) -> Option<File> {
+		let fd = self.infd;
+		if fd < 0 {
+			return None;
+		}
+		self.infd = -1;
+		Some(unsafe { File::from_raw_fd(fd) })
+	}
+
+	/// Take ownership of stdout of the process.
+	///
+	/// If the setup didn't create a pipe for stdout or the pipe was already
+	// taken this function returns None.
+	pub fn stdout(&mut self) -> Option<File> {
+		let fd = self.outfd;
+		if fd < 0 {
+			return None;
+		}
+		self.outfd = -1;
+		Some(unsafe { File::from_raw_fd(fd) })
+	}
+
+	/// Take ownership of stderr of the process.
+	///
+	/// If the setup didn't create a pipe for stderr or the pipe was already
+	// taken this function returns None.
+	pub fn stderr(&mut self) -> Option<File> {
+		let fd = self.errfd;
+		if fd < 0 {
+			return None;
+		}
+		self.errfd = -1;
+		Some(unsafe { File::from_raw_fd(fd) })
+	}
+}
+
 impl Drop for Child {
 	fn drop(&mut self) {
 		unsafe {
@@ -988,44 +1102,6 @@ fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 
 		Ok(())
 	}
-}
-
-fn intern_wait(pid: pid_t) -> WaitResult {
-	if pid <= 0 {
-		return Err(WaitError::ChildInvalid);
-	}
-
-	let mut status: c_int = -1;
-	if unsafe { waitpid(pid, &mut status, 0) } == -1 {
-		return Err(match unsafe { *__errno_location() } {
-			::ECHILD => WaitError::ChildInvalid,
-			::EINTR => WaitError::Interrupted,
-			errno => panic!("unhandled errno: {}", errno)
-		});
-	}
-
-	if unsafe { WIFEXITED(status) } {
-		return Ok(unsafe { WEXITSTATUS(status) });
-	}
-
-	if unsafe { WIFSIGNALED(status) } {
-		return Err(WaitError::ChildSignaled(unsafe { WTERMSIG(status) }));
-	}
-
-	if unsafe { WCOREDUMP(status) } {
-		return Err(WaitError::ChildCoreDumped);
-	}
-
-	if unsafe { WIFSTOPPED(status) } {
-		return Err(WaitError::ChildStopped(unsafe { WSTOPSIG(status) }));
-	}
-
-	if unsafe { WIFCONTINUED(status) } {
-		return Err(WaitError::ChildContinued);
-	}
-
-	return Err(WaitError::ChildInvalid);
-
 }
 
 impl Pipes {
@@ -1228,11 +1304,9 @@ fn make_envp(vars: &HashMap<String, String>) -> (Vec<u8>, Vec<*const c_char>) {
 
 impl Chain {
 	/// Send signal `sig` to all child processes.
-	pub fn kill(&mut self, sig: c_int) -> Result<()> {
-		for child in &self.children {
-			if unsafe { kill(child.pid, sig) } == -1 {
-				return c_err!();
-			}
+	pub fn kill_all(&mut self, sig: c_int) -> result::Result<(), KillError> {
+		for child in &mut self.children {
+			child.kill(sig)?;
 		}
 		Ok(())
 	}
@@ -1309,11 +1383,14 @@ impl Chain {
 			drop(argvbuf);
 			drop(envpbuf);
 
-			if res.is_err() {
-				for mut child in &mut children {
-					unsafe { kill(child.pid, SIGTERM); }
+			match res {
+				Err(err) => {
+					for mut child in &mut children {
+						unsafe { kill(child.pid, SIGTERM); }
+					}
+					return Err(err);
 				}
-				res?;
+				_ => {}
 			}
 
 			children.push(child);
@@ -1355,12 +1432,7 @@ impl Chain {
 	/// given location or the pipe was already taken this function returns None.
 	pub fn stdin_at(&mut self, index: usize) -> Option<File> {
 		if let Some(child) = self.children.get_mut(index) {
-			let fd = child.infd;
-			if fd < 0 {
-				return None;
-			}
-			child.infd = -1;
-			return Some(unsafe { File::from_raw_fd(fd) });
+			return child.stdin();
 		}
 		None
 	}
@@ -1371,12 +1443,7 @@ impl Chain {
 	/// given location or the pipe was already taken this function returns None.
 	pub fn stdout_at(&mut self, index: usize) -> Option<File> {
 		if let Some(child) = self.children.get_mut(index) {
-			let fd = child.outfd;
-			if fd < 0 {
-				return None;
-			}
-			child.outfd = -1;
-			return Some(unsafe { File::from_raw_fd(fd) });
+			return child.stdout();
 		}
 		None
 	}
@@ -1387,25 +1454,28 @@ impl Chain {
 	/// given location or the pipe was already taken this function returns None.
 	pub fn stderr_at(&mut self, index: usize) -> Option<File> {
 		if let Some(child) = self.children.get_mut(index) {
-			let fd = child.errfd;
-			if fd < 0 {
-				return None;
-			}
-			child.errfd = -1;
-			return Some(unsafe { File::from_raw_fd(fd) });
+			return child.stderr();
 		}
 		None
 	}
 
+	pub fn children(&self) -> &[Child] {
+		&self.children[..]
+	}
+
+	pub fn children_mut(&mut self) -> &mut [Child] {
+		&mut self.children[..]
+	}
+
 	/// Wait for all child processes to finish.
 	pub fn wait_all(&mut self) -> Vec<WaitResult> {
-		self.children.iter().map(|child| intern_wait(child.pid)).collect()
+		self.children.iter_mut().map(|child| child.wait()).collect()
 	}
 
 	/// Wait for the last child process to finish.
 	pub fn wait_last(&mut self) -> WaitResult {
 		let index = self.children.len() - 1;
-		intern_wait(self.children[index].pid)
+		self.children[index].wait()
 	}
 
 	/// Close stdin of the first child process and read stdout and stderr
