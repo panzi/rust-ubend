@@ -4,7 +4,7 @@ extern crate pipes;
 use pipes::IntoPipeSetup;
 use std::fs::File;
 use std::fs::OpenOptions;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::fs::remove_file;
 
@@ -143,4 +143,23 @@ fn setenv() {
 	assert_output!(
 		spawn!(FOO="BAR" "./tests/getenv.sh" "FOO"),
 		"BAR\n");
+}
+
+#[test]
+fn temp_file() {
+	let mut chain = spawn!(echo "hello world" >pipes::PipeSetup::Temp).
+		expect("spawn failed");
+	let status = chain.wait_last().expect("wait failed");
+	assert_eq!(status, 0);
+
+	let mut temp = chain.stdout().unwrap();
+	temp.seek(SeekFrom::Start(0)).expect("seek failed");
+
+	let mut buf = Vec::new();
+	temp.read_to_end(&mut buf).expect("read failed");
+
+	assert_eq!(
+			String::from_utf8(buf).
+			expect("reading UTF-8 failed"),
+			"hello world\n");
 }
