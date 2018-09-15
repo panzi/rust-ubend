@@ -1,7 +1,7 @@
 #[macro_use]
-extern crate pipes;
+extern crate ubend;
 
-use pipes::IntoPipeSetup;
+use ubend::IntoPipeSetup;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom};
@@ -71,7 +71,7 @@ fn remove_output_file(name: &str) {
 #[test]
 fn stdio() {
 	assert_output!(
-		spawn!("./tests/stdio.sh" 2>pipes::PipeSetup::Pipe),
+		spawn!("./tests/stdio.sh" 2>ubend::PipeSetup::Pipe),
 		"stdout\n", "stderr\n");
 }
 
@@ -147,7 +147,7 @@ fn setenv() {
 
 #[test]
 fn temp_file() {
-	let mut chain = spawn!(echo "hello world" >pipes::PipeSetup::Temp).
+	let mut chain = spawn!(echo "hello world" >ubend::PipeSetup::Temp).
 		expect("spawn failed");
 	let status = chain.wait_last().expect("wait failed");
 	assert_eq!(status, 0);

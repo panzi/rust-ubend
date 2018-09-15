@@ -4,8 +4,8 @@
 //! processes using a syntax similar to the Unix shell.
 //!
 //! ```
-//! # #[macro_use] extern crate pipes;
-//! # use pipes::IntoPipeSetup;
+//! # #[macro_use] extern crate ubend;
+//! # use ubend::IntoPipeSetup;
 //! 
 //! let output = spawn!(
 //! 		cat <"./tests/input.txt" |
@@ -30,7 +30,7 @@
 //! dynamic strings. Also `FOO="bar" cat <"baz"` is the same as
 //! `FOO = "bar" cat < "baz"`, since whitespace is ignored in Rust.
 //! 
-//! `use pipes::IntoPipeSetup` is needed when passing a file name or
+//! `use ubend::IntoPipeSetup` is needed when passing a file name or
 //! `std::fs::File` as redirection source/target.
 //! 
 //! **Note:** Currently only Linux ist tested. Other Unix operating systems might
@@ -39,11 +39,11 @@
 //! ## More Examples
 //! 
 //! ```
-//! # #[macro_use] extern crate pipes;
-//! # use pipes::IntoPipeSetup;
+//! # #[macro_use] extern crate ubend;
+//! # use ubend::IntoPipeSetup;
 //! # use std::fs::File;
 //! # use std::io::{Read, Seek, SeekFrom};
-//! use pipes::PipeSetup::*;
+//! use ubend::PipeSetup::*;
 //! 
 //! // Ignore stderr
 //! spawn!(rm "no_such_file" 2>Null);
@@ -569,11 +569,11 @@ macro_rules! spawn_internal {
 	};
 
 	(stdout ($($stream:tt)*) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($cont:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!($($cont)* (($($stdin)*) ($($stream)*) ($($stderr)*) (pipes::Target::Stdout) ($($argv)*) ($($envp)*)) ($($chain)*))
+		spawn_internal!($($cont)* (($($stdin)*) ($($stream)*) ($($stderr)*) (ubend::Target::Stdout) ($($argv)*) ($($envp)*)) ($($chain)*))
 	};
 
 	(stderr ($($stream:tt)*) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($cont:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!($($cont)* (($($stdin)*) ($($stdout)*) ($($stream)*) (pipes::Target::Stderr) ($($argv)*) ($($envp)*)) ($($chain)*))
+		spawn_internal!($($cont)* (($($stdin)*) ($($stdout)*) ($($stream)*) (ubend::Target::Stderr) ($($argv)*) ($($envp)*)) ($($chain)*))
 	};
 
 	(@arg ($($arg:tt)*) ($($rest:tt)*) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($chain:tt)*)) => {
@@ -625,7 +625,7 @@ macro_rules! spawn_internal {
 
 	// ========== BODY =========================================================
 	(@body () () (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($chain:tt)*)) => {
-		spawn_internal!(@chain (pipes::Pipes {
+		spawn_internal!(@chain (ubend::Pipes {
 			stdin: $($stdin)*,
 			stdout: $($stdout)*,
 			stderr: $($stderr)*,
@@ -645,7 +645,7 @@ macro_rules! spawn_internal {
 
 	(@body (|) ($($rest:tt)+) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($chain:tt)*)) => {
 		spawn_internal!(@chain
-			(pipes::Pipes {
+			(ubend::Pipes {
 				stdin: $($stdin)*,
 				stdout: $($stdout)*,
 				stderr: $($stderr)*,
@@ -654,40 +654,40 @@ macro_rules! spawn_internal {
 				envp: spawn_internal_envp!($($envp)*)
 			})
 			($($chain)*)
-			(@head () ($($rest)+) ((pipes::PipeSetup::Pipe) (pipes::PipeSetup::Pipe) (pipes::PipeSetup::Inherit) (pipes::Target::Stderr) () ()))
+			(@head () ($($rest)+) ((ubend::PipeSetup::Pipe) (ubend::PipeSetup::Pipe) (ubend::PipeSetup::Inherit) (ubend::Target::Stderr) () ()))
 		)
 	};
 
 	(@body (<) ($($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe stdin (pipes::Mode::Read) () ($($rest)*) ($($opts)*) ($($chain)*))
+		spawn_internal!(@pipe stdin (ubend::Mode::Read) () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body (0) (< $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe stdin (pipes::Mode::Read) () ($($rest)*) ($($opts)*) ($($chain)*))
+		spawn_internal!(@pipe stdin (ubend::Mode::Read) () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body () (>> $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe stdout (pipes::Mode::Append) () ($($rest)*) ($($opts)*) ($($chain)*))
+		spawn_internal!(@pipe stdout (ubend::Mode::Append) () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body (1) (>> $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe stdout (pipes::Mode::Append) () ($($rest)*) ($($opts)*) ($($chain)*))
+		spawn_internal!(@pipe stdout (ubend::Mode::Append) () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body (2) (>> $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe stderr (pipes::Mode::Append) () ($($rest)*) ($($opts)*) ($($chain)*))
+		spawn_internal!(@pipe stderr (ubend::Mode::Append) () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body () (> $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe stdout (pipes::Mode::Write) () ($($rest)*) ($($opts)*) ($($chain)*))
+		spawn_internal!(@pipe stdout (ubend::Mode::Write) () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body (1) (> $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe stdout (pipes::Mode::Write) () ($($rest)*) ($($opts)*) ($($chain)*))
+		spawn_internal!(@pipe stdout (ubend::Mode::Write) () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body (2) (> $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe stderr (pipes::Mode::Write) () ($($rest)*) ($($opts)*) ($($chain)*))
+		spawn_internal!(@pipe stderr (ubend::Mode::Write) () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body ($arg:expr) ($($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
@@ -699,15 +699,15 @@ macro_rules! spawn_internal {
 	};
 
 	// ========== PIPE =========================================================
-	(@pipe $pipe:ident (pipes::Mode::Write) (&) (1 $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!($pipe (pipes::PipeSetup::Redirect(pipes::Target::Stdout)) ($($opts)*) (@body () ($($rest)*)) ($($chain)*))
+	(@pipe $pipe:ident (ubend::Mode::Write) (&) (1 $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
+		spawn_internal!($pipe (ubend::PipeSetup::Redirect(ubend::Target::Stdout)) ($($opts)*) (@body () ($($rest)*)) ($($chain)*))
 	};
 
-	(@pipe $pipe:ident (pipes::Mode::Write) (&) (2 $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!($pipe (pipes::PipeSetup::Redirect(pipes::Target::Stderr)) ($($opts)*) (@body () ($($rest)*)) ($($chain)*))
+	(@pipe $pipe:ident (ubend::Mode::Write) (&) (2 $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
+		spawn_internal!($pipe (ubend::PipeSetup::Redirect(ubend::Target::Stderr)) ($($opts)*) (@body () ($($rest)*)) ($($chain)*))
 	};
 
-	(@pipe $pipe:ident (pipes::Mode::Write) (&) ($tok:tt $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
+	(@pipe $pipe:ident (ubend::Mode::Write) (&) ($tok:tt $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
 		sapwn_unexpected_token!($tok)
 	};
 
@@ -736,14 +736,14 @@ macro_rules! spawn_internal {
 #[macro_export]
 macro_rules! spawn {
 	($($tt:tt)*) => {
-		pipes::Chain::new(
+		ubend::Chain::new(
 			// arguments: @marker (current token) (tokens to parse) ((stdin) (stdout) (stderr) (last) (argv) (envp)) (pipe chain array)
-			spawn_internal!(@head () ($($tt)*) ((pipes::PipeSetup::Inherit) (pipes::PipeSetup::Pipe) (pipes::PipeSetup::Inherit) (pipes::Target::Stderr) () ()) ()))
+			spawn_internal!(@head () ($($tt)*) ((ubend::PipeSetup::Inherit) (ubend::PipeSetup::Pipe) (ubend::PipeSetup::Inherit) (ubend::Target::Stderr) () ()) ()))
 	}
 }
 
 fn open_temp_fd_fallback() -> c_int {
-	let mut name: [u8; 17] = *b"/tmp/pipesXXXXXX\0";
+	let mut name: [u8; 22] = *b"/tmp/rust-ubendXXXXXX\0";
 	let fd = unsafe { mkstemp(name.as_mut_ptr() as *mut c_char) };
 	if fd < 0 {
 		return -1;
@@ -801,7 +801,7 @@ const PIPES_TO_STDOUT: c_int = -5;
 const PIPES_TO_STDERR: c_int = -6;
 const PIPES_TEMP:      c_int = -7;
 
-fn pipes_close(child: &mut ChildIntern) -> c_int {
+fn ubend_close(child: &mut ChildIntern) -> c_int {
 	unsafe {
 		let mut status = 0;
 
@@ -838,13 +838,13 @@ fn handle_error(infd: c_int, outfd: c_int, errfd: c_int, child: &mut ChildIntern
 		if outfd > -1 { close(outfd); }
 		if errfd > -1 { close(errfd); }
 
-		pipes_close(child);
+		ubend_close(child);
 
 		return Err(Error::OS(errno));
 	}
 }
 
-fn pipes_open(argv: *const *const c_char, envp: *const *const c_char, child: &mut ChildIntern, last: Target) -> Result<()> {
+fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mut ChildIntern, last: Target) -> Result<()> {
 	unsafe {
 		let mut infd  = -1;
 		let mut outfd = -1;
@@ -1312,7 +1312,7 @@ impl Chain {
 			let (argvbuf, argv) = make_argv(&pipe.argv);
 			let (envpbuf, envp) = make_envp(&pipe.envp);
 
-			let res = pipes_open((&argv[..]).as_ptr(), (&envp[..]).as_ptr(), &mut child, pipe.last);
+			let res = ubend_open((&argv[..]).as_ptr(), (&envp[..]).as_ptr(), &mut child, pipe.last);
 
 			// I hope these explicit drops ensure the lifetime of the buffers
 			// until this point, even with non-lexical lifetimes.
@@ -1322,7 +1322,7 @@ impl Chain {
 			if res.is_err() {
 				for mut child in &mut children {
 					unsafe { kill(child.pid, SIGTERM); }
-					pipes_close(&mut child);
+					ubend_close(&mut child);
 				}
 				res?;
 			}
@@ -1485,7 +1485,7 @@ impl Chain {
 impl Drop for Chain {
 	fn drop(&mut self) {
 		for mut child in &mut self.children {
-			pipes_close(child);
+			ubend_close(child);
 		}
 	}
 }

@@ -1,7 +1,16 @@
 [package]
-name = "pipes"
+name = "ubend"
 version = "0.1.0"
 authors = ["Mathias Panzenböck <grosser.meister.morti@gmx.net>"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/panzi/ubend"
+homepage = "https://github.com/panzi/ubend"
+documentation = "https://panzi.github.io/ubend"
+description = """
+A small crate that lets you build pipe chains between spawned processes
+using a syntax similar to the Unix shell.
+"""
 
 [dependencies]
 libc = { version = "0.2", default-features = false }
