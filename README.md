@@ -1,13 +1,12 @@
 U-Bend
 ======
 
-
 This is a small crate that lets you build pipe chains between spawned
 processes using a syntax similar to the Unix shell.
 
 ```rust
-# #[macro_use] extern crate ubend;
-# use ubend::IntoPipeSetup;
+#[macro_use] extern crate ubend;
+use ubend::IntoPipeSetup;
 
 let output = spawn!(
 		cat <"./tests/input.txt" |
@@ -38,7 +37,8 @@ dynamic strings. Also `FOO="bar" cat <"baz"` is the same as
 **Note:** Currently only Linux ist tested. Other Unix operating systems might
 work, too. Windows support is not implemented.
 
-## More Examples
+More Examples
+-------------
 
 ```rust
 #[macro_use] extern crate ubend;
