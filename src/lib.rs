@@ -332,7 +332,7 @@ pub struct Pipes {
 }
 
 #[derive(Debug)]
-struct ChildIntern {
+struct Child {
 	pid:   pid_t,
 	infd:  c_int,
 	outfd: c_int,
@@ -342,7 +342,7 @@ struct ChildIntern {
 /// Represents a pipe chain.
 #[derive(Debug)]
 pub struct Chain {
-	children: Vec<ChildIntern>
+	children: Vec<Child>
 }
 
 pub enum Error {
@@ -801,36 +801,28 @@ const PIPES_TO_STDOUT: c_int = -5;
 const PIPES_TO_STDERR: c_int = -6;
 const PIPES_TEMP:      c_int = -7;
 
-fn ubend_close(child: &mut ChildIntern) -> c_int {
-	unsafe {
-		let mut status = 0;
-
-		if child.infd > -1 {
-			if close(child.infd) != 0 {
-				status = -1;
+impl Drop for Child {
+	fn drop(&mut self) {
+		unsafe {
+			if self.infd > -1 {
+				close(self.infd);
+				self.infd = -1;
 			}
-			child.infd = -1;
-		}
 
-		if child.outfd > -1 {
-			if close(child.outfd) != 0 {
-				status = -1;
+			if self.outfd > -1 {
+				close(self.outfd);
+				self.outfd = -1;
 			}
-			child.outfd = -1;
-		}
 
-		if child.errfd > -1 {
-			if close(child.errfd) != 0 {
-				status = -1;
+			if self.errfd > -1 {
+				close(self.errfd);
+				self.errfd = -1;
 			}
-			child.errfd = -1;
 		}
-
-		return status;
 	}
 }
 
-fn handle_error(infd: c_int, outfd: c_int, errfd: c_int, child: &mut ChildIntern) -> Result<()> {
+fn handle_error(infd: c_int, outfd: c_int, errfd: c_int) -> Result<()> {
 	unsafe {
 		let errno = *__errno_location();
 
@@ -838,13 +830,11 @@ fn handle_error(infd: c_int, outfd: c_int, errfd: c_int, child: &mut ChildIntern
 		if outfd > -1 { close(outfd); }
 		if errfd > -1 { close(errfd); }
 
-		ubend_close(child);
-
 		return Err(Error::OS(errno));
 	}
 }
 
-fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mut ChildIntern, last: Target) -> Result<()> {
+fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mut Child, last: Target) -> Result<()> {
 	unsafe {
 		let mut infd  = -1;
 		let mut outfd = -1;
@@ -858,7 +848,7 @@ fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 			::PIPES_PIPE => {
 				let mut pair: [c_int; 2] = [-1, -1];
 				if pipe(pair.as_mut_ptr()) == -1 {
-					return handle_error(infd, outfd, errfd, child);
+					return handle_error(infd, outfd, errfd);
 				}
 				infd = pair[0];
 				child.infd = pair[1];
@@ -867,7 +857,7 @@ fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 				infd = open(cstr!(b"/dev/null\0"), O_RDONLY);
 
 				if infd < 0 {
-					return handle_error(infd, outfd, errfd, child);
+					return handle_error(infd, outfd, errfd);
 				}
 			},
 			::PIPES_TEMP => {
@@ -875,7 +865,7 @@ fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 				child.infd = infd;
 
 				if infd < 0 {
-					return handle_error(infd, outfd, errfd, child);
+					return handle_error(infd, outfd, errfd);
 				}
 			},
 			::PIPES_INHERIT => {},
@@ -885,7 +875,7 @@ fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 			},
 			_ => {
 				*__errno_location() = EINVAL;
-				return handle_error(infd, outfd, errfd, child);
+				return handle_error(infd, outfd, errfd);
 			}
 		}
 
@@ -893,7 +883,7 @@ fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 			::PIPES_PIPE => {
 				let mut pair: [c_int; 2] = [-1, -1];
 				if pipe(pair.as_mut_ptr()) == -1 {
-					return handle_error(infd, outfd, errfd, child);
+					return handle_error(infd, outfd, errfd);
 				}
 				outfd = pair[1];
 				child.outfd = pair[0];
@@ -902,7 +892,7 @@ fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 				outfd = open(cstr!(b"/dev/null\0"), O_RDONLY);
 
 				if outfd < 0 {
-					return handle_error(infd, outfd, errfd, child);
+					return handle_error(infd, outfd, errfd);
 				}
 			},
 			::PIPES_TO_STDERR => {},
@@ -911,7 +901,7 @@ fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 				child.outfd = outfd;
 
 				if outfd < 0 {
-					return handle_error(infd, outfd, errfd, child);
+					return handle_error(infd, outfd, errfd);
 				}
 			},
 			::PIPES_INHERIT => {},
@@ -921,7 +911,7 @@ fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 			},
 			_ => {
 				*__errno_location() = EINVAL;
-				return handle_error(infd, outfd, errfd, child);
+				return handle_error(infd, outfd, errfd);
 			}
 		}
 
@@ -929,7 +919,7 @@ fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 			::PIPES_PIPE => {
 				let mut pair: [c_int; 2] = [-1, -1];
 				if pipe(pair.as_mut_ptr()) == -1 {
-					return handle_error(infd, outfd, errfd, child);
+					return handle_error(infd, outfd, errfd);
 				}
 				errfd = pair[1];
 				child.errfd = pair[0];
@@ -938,7 +928,7 @@ fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 				errfd = open(cstr!(b"/dev/null\0"), O_RDONLY);
 
 				if errfd < 0 {
-					return handle_error(infd, outfd, errfd, child);
+					return handle_error(infd, outfd, errfd);
 				}
 			},
 			::PIPES_TO_STDOUT => {},
@@ -947,7 +937,7 @@ fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 				child.errfd = errfd;
 
 				if errfd < 0 {
-					return handle_error(infd, outfd, errfd, child);
+					return handle_error(infd, outfd, errfd);
 				}
 			},
 			::PIPES_INHERIT => {},
@@ -957,14 +947,14 @@ fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 			},
 			_ => {
 				*__errno_location() = EINVAL;
-				return handle_error(infd, outfd, errfd, child);
+				return handle_error(infd, outfd, errfd);
 			}
 		}
 
 		let pid = fork();
 
 		if pid == -1 {
-			return handle_error(infd, outfd, errfd, child);
+			return handle_error(infd, outfd, errfd);
 		}
 
 		if pid == 0 {
@@ -1281,10 +1271,10 @@ impl Chain {
 			};
 		}
 
-		let mut children = Vec::<ChildIntern>::with_capacity(len);
+		let mut children = Vec::<Child>::with_capacity(len);
 		let mut index = 0;
 		for pipe in pipes {
-			let mut child = unsafe { ChildIntern {
+			let mut child = unsafe { Child {
 				pid: -1,
 				infd:  pipe.stdin.into_raw_fd(),
 				outfd: pipe.stdout.into_raw_fd(),
@@ -1322,7 +1312,6 @@ impl Chain {
 			if res.is_err() {
 				for mut child in &mut children {
 					unsafe { kill(child.pid, SIGTERM); }
-					ubend_close(&mut child);
 				}
 				res?;
 			}
@@ -1335,35 +1324,77 @@ impl Chain {
 	}
 
 	/// Take ownership of stdin of the first process in the chain.
+	///
+	/// If the setup didn't create a pipe at the given location or the pipe was
+	/// already taken this function returns None.
 	pub fn stdin(&mut self) -> Option<File> {
-		let fd = self.children[0].infd;
-		if fd < 0 {
-			return None;
-		}
-		self.children[0].infd = -1;
-		Some(unsafe { File::from_raw_fd(fd) })
+		self.stdin_at(0)
 	}
 
 	/// Take ownership of stdout of the last process in the chain.
+	///
+	/// If the setup didn't create a pipe at the given location or the pipe was
+	/// already taken this function returns None.
 	pub fn stdout(&mut self) -> Option<File> {
 		let index = self.children.len() - 1;
-		let fd = self.children[index].outfd;
-		if fd < 0 {
-			return None;
-		}
-		self.children[index].outfd = -1;
-		Some(unsafe { File::from_raw_fd(fd) })
+		self.stdout_at(index)
 	}
 
 	/// Take ownership of stderr of the last process in the chain.
+	///
+	/// If the setup didn't create a pipe at the given location or the pipe was
+	/// already taken this function returns None.
 	pub fn stderr(&mut self) -> Option<File> {
 		let index = self.children.len() - 1;
-		let fd = self.children[index].errfd;
-		if fd < 0 {
-			return None;
+		self.stderr_at(index)
+	}
+
+	/// Take ownership of stdin of the process at index in the chain.
+	///
+	/// If the index is out of bounds or the setup didn't create a pipe at the
+	/// given location or the pipe was already taken this function returns None.
+	pub fn stdin_at(&mut self, index: usize) -> Option<File> {
+		if let Some(child) = self.children.get_mut(index) {
+			let fd = child.infd;
+			if fd < 0 {
+				return None;
+			}
+			child.infd = -1;
+			return Some(unsafe { File::from_raw_fd(fd) });
 		}
-		self.children[index].errfd = -1;
-		Some(unsafe { File::from_raw_fd(fd) })
+		None
+	}
+
+	/// Take ownership of stdout of the process at index in the chain.
+	///
+	/// If the index is out of bounds or the setup didn't create a pipe at the
+	/// given location or the pipe was already taken this function returns None.
+	pub fn stdout_at(&mut self, index: usize) -> Option<File> {
+		if let Some(child) = self.children.get_mut(index) {
+			let fd = child.outfd;
+			if fd < 0 {
+				return None;
+			}
+			child.outfd = -1;
+			return Some(unsafe { File::from_raw_fd(fd) });
+		}
+		None
+	}
+
+	/// Take ownership of stderr of the process at index in the chain.
+	///
+	/// If the index is out of bounds or the setup didn't create a pipe at the
+	/// given location or the pipe was already taken this function returns None.
+	pub fn stderr_at(&mut self, index: usize) -> Option<File> {
+		if let Some(child) = self.children.get_mut(index) {
+			let fd = child.errfd;
+			if fd < 0 {
+				return None;
+			}
+			child.errfd = -1;
+			return Some(unsafe { File::from_raw_fd(fd) });
+		}
+		None
 	}
 
 	/// Wait for all child processes to finish.
@@ -1478,14 +1509,6 @@ impl Chain {
 				stdout,
 				stderr,
 			})
-		}
-	}
-}
-
-impl Drop for Chain {
-	fn drop(&mut self) {
-		for mut child in &mut self.children {
-			ubend_close(child);
 		}
 	}
 }
