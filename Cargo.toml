@@ -4,9 +4,9 @@ version = "0.1.0"
 authors = ["Mathias Panzenböck <grosser.meister.morti@gmx.net>"]
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/panzi/ubend"
-homepage = "https://github.com/panzi/ubend"
-documentation = "https://panzi.github.io/ubend"
+repository = "https://github.com/panzi/rust-ubend"
+homepage = "https://github.com/panzi/rust-ubend"
+documentation = "https://panzi.github.io/rust-ubend"
 description = """
 A small crate that lets you build pipe chains between spawned processes
 using a syntax similar to the Unix shell.
