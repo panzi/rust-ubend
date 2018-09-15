@@ -8,7 +8,7 @@ processes using a syntax similar to the Unix shell.
 #[macro_use] extern crate ubend;
 use ubend::IntoPipeSetup;
 
-let output = spawn!(
+let output = ubend!(
 		cat <"./tests/input.txt" |
 		grep "spam" |
 		wc "-l"
@@ -51,21 +51,21 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
 // Ignore stderr
-spawn!(rm "no_such_file" 2>Null);
+ubend!(rm "no_such_file" 2>Null);
 
 // Redirect stderr to stdout
-spawn!(rm "no_such_file" 2>&1);
+ubend!(rm "no_such_file" 2>&1);
 
 // Write stderr to stderr of this process
-spawn!(rm "no_such_file" 2>Inherit);
+ubend!(rm "no_such_file" 2>Inherit);
 
 // Read from a file opened in Rust
 let file = File::open("./tests/input.txt").
 	expect("couldn't open file");
-spawn!(grep "spam" <file);
+ubend!(grep "spam" <file);
 
 // Write stderr to a temp file
-let mut chain = spawn!(rm "no_such_file" 2>Temp).
+let mut chain = ubend!(rm "no_such_file" 2>Temp).
 	expect("spawn failed");
 
 chain.wait_last().
