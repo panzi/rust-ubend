@@ -7,7 +7,7 @@
 //! # #[macro_use] extern crate ubend;
 //! # use ubend::IntoPipeSetup;
 //! 
-//! let output = spawn!(
+//! let output = ubend!(
 //! 		cat <"./tests/input.txt" |
 //! 		grep "spam" |
 //! 		wc "-l"
@@ -46,21 +46,21 @@
 //! use ubend::PipeSetup::*;
 //! 
 //! // Ignore stderr
-//! spawn!(rm "no_such_file" 2>Null);
+//! ubend!(rm "no_such_file" 2>Null);
 //! 
 //! // Redirect stderr to stdout
-//! spawn!(rm "no_such_file" 2>&1);
+//! ubend!(rm "no_such_file" 2>&1);
 //! 
 //! // Write stderr to stderr of this process
-//! spawn!(rm "no_such_file" 2>Inherit);
+//! ubend!(rm "no_such_file" 2>Inherit);
 //! 
 //! // Read from a file opened in Rust
 //! let file = File::open("./tests/input.txt").
 //! 	expect("couldn't open file");
-//! spawn!(grep "spam" <file);
+//! ubend!(grep "spam" <file);
 //! 
 //! // Write stderr to a temp file
-//! let mut chain = spawn!(rm "no_such_file" 2>Temp).
+//! let mut chain = ubend!(rm "no_such_file" 2>Temp).
 //! 	expect("spawn failed");
 //! 
 //! chain.wait_last().
@@ -533,25 +533,25 @@ impl std::fmt::Debug for OutputError {
 
 #[macro_export]
 #[doc(hidden)]
-macro_rules! sapwn_unexpected_end {
+macro_rules! ubend_unexpected_end {
 	($tt:tt) => {}
 }
 
 #[macro_export]
 #[doc(hidden)]
-macro_rules! sapwn_unexpected_token {
+macro_rules! ubend_unexpected_token {
 	() => {}
 }
 
 #[macro_export]
 #[doc(hidden)]
-macro_rules! sapwn_illegal_mode {
+macro_rules! ubend_illegal_mode {
 	() => {}
 }
 
 #[macro_export]
 #[doc(hidden)]
-macro_rules! spawn_internal_envp {
+macro_rules! ubend_internal_envp {
 	($((($($key:tt)*) ($($val:tt)*)))*) => {
 		{
 			let mut envp = std::collections::HashMap::new();
@@ -563,55 +563,55 @@ macro_rules! spawn_internal_envp {
 
 #[macro_export]
 #[doc(hidden)]
-macro_rules! spawn_internal {
+macro_rules! ubend_internal {
 	(stdin ($($stream:tt)*) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($cont:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!($($cont)* (($($stream)*) ($($stdout)*) ($($stderr)*) ($($last)*) ($($argv)*) ($($envp)*)) ($($chain)*))
+		ubend_internal!($($cont)* (($($stream)*) ($($stdout)*) ($($stderr)*) ($($last)*) ($($argv)*) ($($envp)*)) ($($chain)*))
 	};
 
 	(stdout ($($stream:tt)*) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($cont:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!($($cont)* (($($stdin)*) ($($stream)*) ($($stderr)*) (ubend::Target::Stdout) ($($argv)*) ($($envp)*)) ($($chain)*))
+		ubend_internal!($($cont)* (($($stdin)*) ($($stream)*) ($($stderr)*) (ubend::Target::Stdout) ($($argv)*) ($($envp)*)) ($($chain)*))
 	};
 
 	(stderr ($($stream:tt)*) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($cont:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!($($cont)* (($($stdin)*) ($($stdout)*) ($($stream)*) (ubend::Target::Stderr) ($($argv)*) ($($envp)*)) ($($chain)*))
+		ubend_internal!($($cont)* (($($stdin)*) ($($stdout)*) ($($stream)*) (ubend::Target::Stderr) ($($argv)*) ($($envp)*)) ($($chain)*))
 	};
 
 	(@arg ($($arg:tt)*) ($($rest:tt)*) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($chain:tt)*)) => {
-		spawn_internal!(@body () ($($rest)*) (($($stdin)*) ($($stdout)*) ($($stderr)*) ($($last)*) ($($argv)* ($($arg)*)) ($($envp)*)) ($($chain)*))
+		ubend_internal!(@body () ($($rest)*) (($($stdin)*) ($($stdout)*) ($($stderr)*) ($($last)*) ($($argv)* ($($arg)*)) ($($envp)*)) ($($chain)*))
 	};
 
 	(@var ($($key:tt)*) ($($val:tt)*) ($($rest:tt)*) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($chain:tt)*)) => {
-		spawn_internal!(@head () ($($rest)*) (($($stdin)*) ($($stdout)*) ($($stderr)*) ($($last)*) ($($argv)*) ($($envp)* (($($key)*) ($($val)*)))) ($($chain)*))
+		ubend_internal!(@head () ($($rest)*) (($($stdin)*) ($($stdout)*) ($($stderr)*) ($($last)*) ($($argv)*) ($($envp)* (($($key)*) ($($val)*)))) ($($chain)*))
 	};
 
 	// ========== ENVIRONMENT VARIABLES ========================================
 	(@env ($key:ident) ($val:expr) ($($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@var (stringify!($key)) ($val) ($($rest)*) ($($opts)*) ($($chain)*))
+		ubend_internal!(@var (stringify!($key)) ($val) ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@env ($key:ident) ($($tt:tt)*) ($tok:tt $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@env ($key) ($($tt)* $tok) ($($rest)*) ($($opts)*) ($($chain)*))
+		ubend_internal!(@env ($key) ($($tt)* $tok) ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	// ========== HEAD =========================================================
 	(@head ($id:ident) (= $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@env ($id) () ($($rest)*) ($($opts)*) ($($chain)*))
+		ubend_internal!(@env ($id) () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@head ($id:ident) ($($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@arg (stringify!($id)) ($($rest)*) ($($opts)*) ($($chain)*))
+		ubend_internal!(@arg (stringify!($id)) ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@head ($id:expr) ($($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@arg ($id) ($($rest)*) ($($opts)*) ($($chain)*))
+		ubend_internal!(@arg ($id) ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@head () ($tok:tt $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@head ($tok) ($($rest)*) ($($opts)*) ($($chain)*))
+		ubend_internal!(@head ($tok) ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@head ($tt:tt) ($($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		sapwn_unexpected_token!($tt)
+		ubend_unexpected_token!($tt)
 	};
 
 	// ========== HELPER =======================================================
@@ -620,38 +620,38 @@ macro_rules! spawn_internal {
 	};
 
 	(@chain ($($elem:tt)*) ($($chain:tt)*) ($($cont:tt)*)) => {
-		spawn_internal!($($cont)* ($($chain)* ($($elem)*)))
+		ubend_internal!($($cont)* ($($chain)* ($($elem)*)))
 	};
 
 	// ========== BODY =========================================================
 	(@body () () (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($chain:tt)*)) => {
-		spawn_internal!(@chain (ubend::Pipes {
+		ubend_internal!(@chain (ubend::Pipes {
 			stdin: $($stdin)*,
 			stdout: $($stdout)*,
 			stderr: $($stderr)*,
 			last: $($last)*,
 			argv: vec![$($argv.to_string()),*],
-			envp: spawn_internal_envp!($($envp)*)
+			envp: ubend_internal_envp!($($envp)*)
 		}) ($($chain)*) (@end))
 	};
 
 	(@body (|) () ($($opts:tt)*) ($($chain:tt)*)) => {
-		sapwn_unexpected_end!()
+		ubend_unexpected_end!()
 	};
 
 	(@body (|) (| $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		sapwn_unexpected_token!(|)
+		ubend_unexpected_token!(|)
 	};
 
 	(@body (|) ($($rest:tt)+) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($chain:tt)*)) => {
-		spawn_internal!(@chain
+		ubend_internal!(@chain
 			(ubend::Pipes {
 				stdin: $($stdin)*,
 				stdout: $($stdout)*,
 				stderr: $($stderr)*,
 				last: $($last)*,
 				argv: vec![$($argv.to_string()),*],
-				envp: spawn_internal_envp!($($envp)*)
+				envp: ubend_internal_envp!($($envp)*)
 			})
 			($($chain)*)
 			(@head () ($($rest)+) ((ubend::PipeSetup::Pipe) (ubend::PipeSetup::Pipe) (ubend::PipeSetup::Inherit) (ubend::Target::Stderr) () ()))
@@ -659,86 +659,86 @@ macro_rules! spawn_internal {
 	};
 
 	(@body (<) ($($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe stdin (ubend::Mode::Read) () ($($rest)*) ($($opts)*) ($($chain)*))
+		ubend_internal!(@pipe stdin (ubend::Mode::Read) () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body (0) (< $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe stdin (ubend::Mode::Read) () ($($rest)*) ($($opts)*) ($($chain)*))
+		ubend_internal!(@pipe stdin (ubend::Mode::Read) () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body () (>> $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe stdout (ubend::Mode::Append) () ($($rest)*) ($($opts)*) ($($chain)*))
+		ubend_internal!(@pipe stdout (ubend::Mode::Append) () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body (1) (>> $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe stdout (ubend::Mode::Append) () ($($rest)*) ($($opts)*) ($($chain)*))
+		ubend_internal!(@pipe stdout (ubend::Mode::Append) () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body (2) (>> $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe stderr (ubend::Mode::Append) () ($($rest)*) ($($opts)*) ($($chain)*))
+		ubend_internal!(@pipe stderr (ubend::Mode::Append) () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body () (> $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe stdout (ubend::Mode::Write) () ($($rest)*) ($($opts)*) ($($chain)*))
+		ubend_internal!(@pipe stdout (ubend::Mode::Write) () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body (1) (> $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe stdout (ubend::Mode::Write) () ($($rest)*) ($($opts)*) ($($chain)*))
+		ubend_internal!(@pipe stdout (ubend::Mode::Write) () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body (2) (> $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe stderr (ubend::Mode::Write) () ($($rest)*) ($($opts)*) ($($chain)*))
+		ubend_internal!(@pipe stderr (ubend::Mode::Write) () ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body ($arg:expr) ($($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@arg ($arg) ($($rest)*) ($($opts)*) ($($chain)*))
+		ubend_internal!(@arg ($arg) ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body ($($tt:tt)*) ($tok:tt $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@body ($($tt)* $tok) ($($rest)*) ($($opts)*) ($($chain)*))
+		ubend_internal!(@body ($($tt)* $tok) ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	// ========== PIPE =========================================================
 	(@pipe $pipe:ident (ubend::Mode::Write) (&) (1 $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!($pipe (ubend::PipeSetup::Redirect(ubend::Target::Stdout)) ($($opts)*) (@body () ($($rest)*)) ($($chain)*))
+		ubend_internal!($pipe (ubend::PipeSetup::Redirect(ubend::Target::Stdout)) ($($opts)*) (@body () ($($rest)*)) ($($chain)*))
 	};
 
 	(@pipe $pipe:ident (ubend::Mode::Write) (&) (2 $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!($pipe (ubend::PipeSetup::Redirect(ubend::Target::Stderr)) ($($opts)*) (@body () ($($rest)*)) ($($chain)*))
+		ubend_internal!($pipe (ubend::PipeSetup::Redirect(ubend::Target::Stderr)) ($($opts)*) (@body () ($($rest)*)) ($($chain)*))
 	};
 
 	(@pipe $pipe:ident (ubend::Mode::Write) (&) ($tok:tt $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		sapwn_unexpected_token!($tok)
+		ubend_unexpected_token!($tok)
 	};
 
 	(@pipe $pipe:ident ($($mode:tt)*) (&) ($tok:tt $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		sapwn_illegal_mode!($mode)
+		ubend_illegal_mode!($mode)
 	};
 
 	(@pipe $pipe:ident ($($mode:tt)*) ($($tt:tt)*) (:: $tok:tt $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe $pipe ($($mode)*) ($($tt)* :: $tok) ($($rest)*) ($($opts)*) ($($chain)*))
+		ubend_internal!(@pipe $pipe ($($mode)*) ($($tt)* :: $tok) ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@pipe $pipe:ident ($($mode:tt)*) ($($tt:tt)*) (. $tok:tt $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe $pipe ($($mode)*) ($($tt)* . $tok) ($($rest)*) ($($opts)*) ($($chain)*))
+		ubend_internal!(@pipe $pipe ($($mode)*) ($($tt)* . $tok) ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@pipe $pipe:ident ($($mode:tt)*) ($io:expr) ($($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!($pipe ($io.into_pipe_setup($($mode)*)) ($($opts)*) (@body () ($($rest)*)) ($($chain)*))
+		ubend_internal!($pipe ($io.into_pipe_setup($($mode)*)) ($($opts)*) (@body () ($($rest)*)) ($($chain)*))
 	};
 
 	(@pipe $pipe:ident ($($mode:tt)*) ($($tt:tt)*) ($tok:tt $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
-		spawn_internal!(@pipe $pipe ($($mode)*) ($($tt)* $tok) ($($rest)*) ($($opts)*) ($($chain)*))
+		ubend_internal!(@pipe $pipe ($($mode)*) ($($tt)* $tok) ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 }
 
 /// Create a pipe chain using a Unix shell like syntax.
 #[macro_export]
-macro_rules! spawn {
+macro_rules! ubend {
 	($($tt:tt)*) => {
 		ubend::Chain::new(
 			// arguments: @marker (current token) (tokens to parse) ((stdin) (stdout) (stderr) (last) (argv) (envp)) (pipe chain array)
-			spawn_internal!(@head () ($($tt)*) ((ubend::PipeSetup::Inherit) (ubend::PipeSetup::Pipe) (ubend::PipeSetup::Inherit) (ubend::Target::Stderr) () ()) ()))
+			ubend_internal!(@head () ($($tt)*) ((ubend::PipeSetup::Inherit) (ubend::PipeSetup::Pipe) (ubend::PipeSetup::Inherit) (ubend::Target::Stderr) () ()) ()))
 	}
 }
 
@@ -1247,7 +1247,7 @@ impl Chain {
 		Ok(())
 	}
 
-	/// Create a new pipe chain. This function is called by the [spawn!] macro.
+	/// Create a new pipe chain. This function is called by the [ubend!] macro.
 	pub fn new(pipes: Vec<Pipes>) -> Result<Self> {
 		let len = pipes.len();
 		if len == 0 {

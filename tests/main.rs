@@ -71,7 +71,7 @@ fn remove_output_file(name: &str) {
 #[test]
 fn stdio() {
 	assert_output!(
-		spawn!("./tests/stdio.sh" 2>ubend::PipeSetup::Pipe),
+		ubend!("./tests/stdio.sh" 2>ubend::PipeSetup::Pipe),
 		"stdout\n", "stderr\n");
 }
 
@@ -79,7 +79,7 @@ fn stdio() {
 fn read_and_write_file_by_name() {
 	remove_output_file("./tests/read_and_write_file_by_name.txt");
 
-	assert_wait!(spawn!(
+	assert_wait!(ubend!(
 		grep "spam" <"./tests/input.txt" |
 		cat >&1 |
 		wc "-l" >"./tests/read_and_write_file_by_name.txt"
@@ -101,7 +101,7 @@ fn write_file_by_handle() {
 	open("./tests/write_file_by_handle.txt").
 	expect("couldn't open write_file_by_handle.txt");
 
-	assert_wait!(spawn!(
+	assert_wait!(ubend!(
 		grep "spam" <"./tests/input.txt" |
 		cat >&1 |
 		wc "-l" >file
@@ -115,7 +115,7 @@ fn write_file_by_handle() {
 #[test]
 fn read_file_by_handle() {
 	let file = File::open("./tests/input.txt").expect("couldn't open input.txt");
-	assert_output!(spawn!(
+	assert_output!(ubend!(
 		grep "spam" <file |
 		wc "-l"
 	), "3\n");
@@ -126,13 +126,13 @@ fn append() {
 	remove_output_file("./tests/append.txt");
 
 	assert_wait!(
-		spawn!(echo "first line" > "./tests/append.txt").
+		ubend!(echo "first line" > "./tests/append.txt").
 		expect("spawn failed"));
 
 	assert_file_contens!("./tests/append.txt", "first line\n");
 
 	assert_wait!(
-		spawn!(echo "second line" >> "./tests/append.txt").
+		ubend!(echo "second line" >> "./tests/append.txt").
 		expect("spawn failed"));
 
 	assert_file_contens!("./tests/append.txt", "first line\nsecond line\n");
@@ -141,13 +141,13 @@ fn append() {
 #[test]
 fn setenv() {
 	assert_output!(
-		spawn!(FOO="BAR" "./tests/getenv.sh" "FOO"),
+		ubend!(FOO="BAR" "./tests/getenv.sh" "FOO"),
 		"BAR\n");
 }
 
 #[test]
 fn temp_file() {
-	let mut chain = spawn!(echo "hello world" >ubend::PipeSetup::Temp).
+	let mut chain = ubend!(echo "hello world" >ubend::PipeSetup::Temp).
 		expect("spawn failed");
 	let status = chain.wait_last().expect("wait failed");
 	assert_eq!(status, 0);
