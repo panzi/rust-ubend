@@ -37,6 +37,8 @@ dynamic strings. Also `FOO="bar" cat <"baz"` is the same as
 **Note:** Currently only Linux ist tested. Other Unix operating systems might
 work, too. Windows support is not implemented.
 
+[API documentation](https://panzi.github.io/rust-ubend/ubend/)
+
 More Examples
 -------------
 
