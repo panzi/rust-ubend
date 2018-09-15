@@ -4,7 +4,7 @@ processes using a syntax similar to the Unix shell.</p>
 
 <pre class="rust rust-example-rendered">
  
-<span class="kw">let</span> <span class="ident">output</span> <span class="op">=</span> <span class="macro">spawn</span><span class="macro">!</span>(
+<span class="kw">let</span> <span class="ident">output</span> <span class="op">=</span> <span class="macro">ubend</span><span class="macro">!</span>(
         <span class="ident">cat</span> <span class="op">&lt;</span><span class="string">&quot;./tests/input.txt&quot;</span> <span class="op">|</span>
         <span class="ident">grep</span> <span class="string">&quot;spam&quot;</span> <span class="op">|</span>
         <span class="ident">wc</span> <span class="string">&quot;-l&quot;</span>
@@ -33,21 +33,21 @@ work, too. Windows support is not implemented.</p>
 <span class="kw">use</span> <span class="ident">ubend</span>::<span class="ident">PipeSetup</span>::<span class="kw-2">*</span>;
  
 <span class="comment">// Ignore stderr</span>
-<span class="macro">spawn</span><span class="macro">!</span>(<span class="ident">rm</span> <span class="string">&quot;no_such_file&quot;</span> <span class="number">2</span><span class="op">&gt;</span><span class="ident">Null</span>);
+<span class="macro">ubend</span><span class="macro">!</span>(<span class="ident">rm</span> <span class="string">&quot;no_such_file&quot;</span> <span class="number">2</span><span class="op">&gt;</span><span class="ident">Null</span>);
  
 <span class="comment">// Redirect stderr to stdout</span>
-<span class="macro">spawn</span><span class="macro">!</span>(<span class="ident">rm</span> <span class="string">&quot;no_such_file&quot;</span> <span class="number">2</span><span class="op">&gt;</span><span class="kw-2">&amp;</span><span class="number">1</span>);
+<span class="macro">ubend</span><span class="macro">!</span>(<span class="ident">rm</span> <span class="string">&quot;no_such_file&quot;</span> <span class="number">2</span><span class="op">&gt;</span><span class="kw-2">&amp;</span><span class="number">1</span>);
  
 <span class="comment">// Write stderr to stderr of this process</span>
-<span class="macro">spawn</span><span class="macro">!</span>(<span class="ident">rm</span> <span class="string">&quot;no_such_file&quot;</span> <span class="number">2</span><span class="op">&gt;</span><span class="ident">Inherit</span>);
+<span class="macro">ubend</span><span class="macro">!</span>(<span class="ident">rm</span> <span class="string">&quot;no_such_file&quot;</span> <span class="number">2</span><span class="op">&gt;</span><span class="ident">Inherit</span>);
  
 <span class="comment">// Read from a file opened in Rust</span>
 <span class="kw">let</span> <span class="ident">file</span> <span class="op">=</span> <span class="ident">File</span>::<span class="ident">open</span>(<span class="string">&quot;./tests/input.txt&quot;</span>).
     <span class="ident">expect</span>(<span class="string">&quot;couldn&#39;t open file&quot;</span>);
-<span class="macro">spawn</span><span class="macro">!</span>(<span class="ident">grep</span> <span class="string">&quot;spam&quot;</span> <span class="op">&lt;</span><span class="ident">file</span>);
+<span class="macro">ubend</span><span class="macro">!</span>(<span class="ident">grep</span> <span class="string">&quot;spam&quot;</span> <span class="op">&lt;</span><span class="ident">file</span>);
  
 <span class="comment">// Write stderr to a temp file</span>
-<span class="kw">let</span> <span class="kw-2">mut</span> <span class="ident">chain</span> <span class="op">=</span> <span class="macro">spawn</span><span class="macro">!</span>(<span class="ident">rm</span> <span class="string">&quot;no_such_file&quot;</span> <span class="number">2</span><span class="op">&gt;</span><span class="ident">Temp</span>).
+<span class="kw">let</span> <span class="kw-2">mut</span> <span class="ident">chain</span> <span class="op">=</span> <span class="macro">ubend</span><span class="macro">!</span>(<span class="ident">rm</span> <span class="string">&quot;no_such_file&quot;</span> <span class="number">2</span><span class="op">&gt;</span><span class="ident">Temp</span>).
     <span class="ident">expect</span>(<span class="string">&quot;spawn failed&quot;</span>);
  
 <span class="ident">chain</span>.<span class="ident">wait_last</span>().
@@ -62,8 +62,8 @@ work, too. Windows support is not implemented.</p>
 </div><h2 id='macros' class='section-header'><a href="#macros">Macros</a></h2>
 <table>
                        <tr class=' module-item'>
-                           <td><a class="macro" href="macro.spawn.html"
-                                  title='macro ubend::spawn'>spawn</a></td>
+                           <td><a class="macro" href="macro.ubend.html"
+                                  title='macro ubend::ubend'>ubend</a></td>
                            <td class='docblock-short'>
                                 <p>Create a pipe chain using a Unix shell like syntax.</p>
 

@@ -4,7 +4,7 @@
     Null,
     Redirect(<a class="enum" href="../ubend/enum.Target.html" title="enum ubend::Target">Target</a>),
     Temp,
-    FileDescr(<a class="type" href="https://rust-lang.github.io/libc/x86_64-unknown-linux-gnu/libc/type.c_int.html" title="type libc::c_int">c_int</a>),
+    FileDescr(<a class="type" href="../libc/type.c_int.html" title="type libc::c_int">c_int</a>),
     FileName(<a class="struct" href="https://doc.rust-lang.org/nightly/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>,&nbsp;<a class="enum" href="../ubend/enum.Mode.html" title="enum ubend::Mode">Mode</a>),
     File(<a class="struct" href="https://doc.rust-lang.org/nightly/std/fs/struct.File.html" title="struct std::fs::File">File</a>),
 }</pre></div><div class='docblock'><p>Setup a pipe.</p>
@@ -26,7 +26,7 @@ deleted after the file handle to it is closed.</p>
 <p>If the operating system or filesystem of <code>/tmp</code> does not support the
 <code>O_TMPFILE</code> flag the same behaviour is emulated by opening a new file
 using <code>mkstemp()</code> and then immediately <code>unlink()</code>ed.</p>
-</div><span id="variant.FileDescr" class="variant small-section-header"><a href="#variant.FileDescr" class="anchor field"></a><span id='FileDescr.v' class='invisible'><code>FileDescr(<a class="type" href="https://rust-lang.github.io/libc/x86_64-unknown-linux-gnu/libc/type.c_int.html" title="type libc::c_int">c_int</a>)</code></span></span><div class='docblock'><p>Connect the stream to the specified file descriptor. Note that error
+</div><span id="variant.FileDescr" class="variant small-section-header"><a href="#variant.FileDescr" class="anchor field"></a><span id='FileDescr.v' class='invisible'><code>FileDescr(<a class="type" href="../libc/type.c_int.html" title="type libc::c_int">c_int</a>)</code></span></span><div class='docblock'><p>Connect the stream to the specified file descriptor. Note that error
 or not any passed file descriptor will be consumed (closed) by
 [Chain::new()].</p>
 </div><span id="variant.FileName" class="variant small-section-header"><a href="#variant.FileName" class="anchor field"></a><span id='FileName.v' class='invisible'><code>FileName(<a class="struct" href="https://doc.rust-lang.org/nightly/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>,&nbsp;<a class="enum" href="../ubend/enum.Mode.html" title="enum ubend::Mode">Mode</a>)</code></span></span><div class='docblock'><p>Connect the stream to the specified file using the specified mode.</p>
