@@ -4,7 +4,7 @@ extern crate ubend;
 use ubend::IntoPipeSetup;
 use std::fs::File;
 use std::fs::OpenOptions;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Write, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::fs::remove_file;
 
@@ -103,7 +103,7 @@ fn write_file_by_handle() {
 
 	assert_wait!(ubend!(
 		grep "spam" <"./tests/input.txt" |
-		cat >&1 |
+		cat |
 		wc "-l" >file
 	).expect("spawn failed"));
 
@@ -162,4 +162,59 @@ fn temp_file() {
 			String::from_utf8(buf).
 			expect("reading UTF-8 failed"),
 			"hello world\n");
+}
+
+#[test]
+fn write_to_null() {
+	let state = ubend!(echo "hello world" >ubend::PipeSetup::Null).
+	expect("spawn failed").wait_last().expect("wait failed");
+
+	assert_eq!(state, 0);
+}
+
+#[test]
+fn stdin_as_pipe() {
+	let mut chain = ubend!(cat <ubend::PipeSetup::Pipe|cat).expect("spawn failed");
+	{
+		let mut stream = chain.stdin().unwrap();
+		write!(stream, "hello world");
+	}
+
+	let out = chain.output().expect("reading output failed");
+
+	assert_eq!(
+		String::from_utf8(out.stdout).
+		expect("reading UTF-8 from stdout failed"),
+		"hello world");
+
+	assert_eq!(out.status, 0);
+}
+
+#[test]
+fn deep_cat() {
+	assert_output!(
+		ubend!(echo "hello world"|cat|cat >&1|cat|cat),
+		"hello world\n");
+}
+
+#[test]
+fn strange_setup() {
+	use ubend::PipeSetup::{*};
+
+	let mut chain = ubend!(
+		echo "hello world" <Inherit >Inherit |
+		grep "spam" <Pipe |
+		wc "-l" <Pipe).expect("spawn failed");
+
+	{
+		let mut stream = chain.stdin_at(1).unwrap();
+		write!(stream, "spam\neggs\nspam spam\n");
+	}
+
+	let output = chain.output().expect("reading output failed");
+	assert_eq!(output.status, 0);
+
+	let num = String::from_utf8(output.stdout).
+		expect("reading UTF-8 failed");
+	assert_eq!(num.trim(), "2");
 }

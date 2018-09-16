@@ -90,7 +90,7 @@ use std::io::Read;
 
 use libc::{
 	fork,
-	pipe,
+	pipe2, // Linux & FreeBSD (macOS?)
 	strerror_r, // XSI
 	perror,
 	open,
@@ -121,6 +121,7 @@ use libc::{
 	O_CREAT,
 	O_TRUNC,
 	O_RDWR,
+	O_CLOEXEC,
 	S_IRUSR,
 	S_IWUSR,
 	S_IRGRP,
@@ -144,7 +145,11 @@ use libc::{
 	POLLIN,
 	POLLERR,
 	POLLHUP,
-	POLLNVAL
+	POLLNVAL,
+	fcntl,
+	F_GETFD,
+	F_SETFD,
+	FD_CLOEXEC
 };
 
 #[cfg(target_os = "macos")]
@@ -360,12 +365,6 @@ pub enum Error {
 
 	/// A pipe chain has to have at least one command.
 	NotEnoughPipes,
-
-	/// If stdin of a child process is marked as `PipeSetup::Pipe` then stdout
-	/// of the previous process in the chain has to be `PipeSetup::Pipe` or
-	/// `PipeSetup::Redirect(Target::Stdout)` or stderr of that previous
-	/// process has to be `PipeSetup::Redirect(Target::Stdout)`.
-	InvalidPipeLinkup
 }
 
 pub enum WaitError {
@@ -487,7 +486,6 @@ impl Display for Error {
 			Error::CannotRedirectStdinTo(Target::Stdout) => f.write_str("cannot redirect stdin to stdout"),
 			Error::CannotRedirectStdinTo(Target::Stderr) => f.write_str("cannot redirect stdin to stderr"),
 			Error::NotEnoughPipes => f.write_str("not enough pipes (need at least one)"),
-			Error::InvalidPipeLinkup => f.write_str("invalid pipe linkup"),
 		}
 	}
 }
@@ -792,15 +790,40 @@ fn open_temp_fd() -> c_int {
 }
 
 fn redirect_fd(oldfd: c_int, newfd: c_int, errmsg: *const c_char) {
-	if oldfd > -1 && oldfd != newfd {
-		if unsafe { dup2(oldfd, newfd) } == -1 {
-			unsafe {
-				perror(errmsg);
-				exit(EXIT_FAILURE);
+	unsafe {
+		if oldfd > -1 {
+			if oldfd == newfd {
+				// In the (unlikely) case the new file descriptor is the same
+				// as the old file descriptor we still need to make sure the
+				// close on exec flag is NOT set.
+				//
+				// This can only happen if the calling process closed all its
+				// standard IO streams (thus making them available) and thus
+				// the pipe2() call happened to yield the needed target file
+				// descriptor just by chance.
+				let flags = fcntl(oldfd, F_GETFD);
+
+				if flags == -1 {
+					perror(errmsg);
+					exit(EXIT_FAILURE);
+				}
+
+				if flags & FD_CLOEXEC != 0 {
+					let flags = flags & !FD_CLOEXEC;
+
+					if fcntl(oldfd, F_SETFD, flags) != 0 {
+						perror(errmsg);
+						exit(EXIT_FAILURE);
+					}
+				}
+			} else {
+				if dup2(oldfd, newfd) == -1 {
+					perror(errmsg);
+					exit(EXIT_FAILURE);
+				}
+				close(oldfd);
 			}
 		}
-
-		unsafe { close(oldfd); }
 	}
 }
 
@@ -961,7 +984,7 @@ fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 		match inaction {
 			::PIPES_PIPE => {
 				let mut pair: [c_int; 2] = [-1, -1];
-				if pipe(pair.as_mut_ptr()) == -1 {
+				if pipe2(pair.as_mut_ptr(), O_CLOEXEC) == -1 {
 					return handle_error(infd, outfd, errfd);
 				}
 				infd = pair[0];
@@ -996,14 +1019,14 @@ fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 		match outaction {
 			::PIPES_PIPE => {
 				let mut pair: [c_int; 2] = [-1, -1];
-				if pipe(pair.as_mut_ptr()) == -1 {
+				if pipe2(pair.as_mut_ptr(), O_CLOEXEC) == -1 {
 					return handle_error(infd, outfd, errfd);
 				}
 				outfd = pair[1];
 				child.outfd = pair[0];
 			},
 			::PIPES_NULL => {
-				outfd = open(cstr!(b"/dev/null\0"), O_RDONLY);
+				outfd = open(cstr!(b"/dev/null\0"), O_WRONLY);
 
 				if outfd < 0 {
 					return handle_error(infd, outfd, errfd);
@@ -1032,14 +1055,14 @@ fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 		match erraction {
 			::PIPES_PIPE => {
 				let mut pair: [c_int; 2] = [-1, -1];
-				if pipe(pair.as_mut_ptr()) == -1 {
+				if pipe2(pair.as_mut_ptr(), O_CLOEXEC) == -1 {
 					return handle_error(infd, outfd, errfd);
 				}
 				errfd = pair[1];
 				child.errfd = pair[0];
 			},
 			::PIPES_NULL => {
-				errfd = open(cstr!(b"/dev/null\0"), O_RDONLY);
+				errfd = open(cstr!(b"/dev/null\0"), O_WRONLY);
 
 				if errfd < 0 {
 					return handle_error(infd, outfd, errfd);
@@ -1073,6 +1096,23 @@ fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 
 		if pid == 0 {
 			// child
+
+			// close unused ends
+			if child.infd > -1 && child.infd != infd {
+				close(child.infd);
+				child.infd = -1;
+			}
+
+			if child.outfd > -1 && child.outfd != outfd {
+				close(child.outfd);
+				child.outfd = -1;
+			}
+
+			if child.errfd > -1 && child.errfd != errfd {
+				close(child.errfd);
+				child.errfd = -1;
+			}
+
 			redirect_fd(infd, STDIN_FILENO, cstr!(b"redirecting stdin\0"));
 
 			if last == Target::Stderr {
@@ -1244,6 +1284,46 @@ impl Pipes {
 		self.stderr = setup;
 		self.last = Target::Stderr;
 	}
+
+	pub fn open(self) -> Result<Child> {
+		if self.argv.is_empty() {
+			return Err(Error::NotEnoughArguments);
+		}
+
+		match self.stdin {
+			PipeSetup::Redirect(target) => {
+				return Err(Error::CannotRedirectStdinTo(target));
+			},
+			_ => {}
+		}
+
+		let mut child = unsafe { Child {
+			pid: -1,
+			infd:  self.stdin.into_raw_fd(),
+			outfd: self.stdout.into_raw_fd(),
+			errfd: self.stderr.into_raw_fd()
+		}};
+
+		if child.outfd == PIPES_TO_STDOUT {
+			child.outfd = PIPES_PIPE;
+		}
+
+		if child.errfd == PIPES_TO_STDERR {
+			child.errfd = PIPES_PIPE;
+		}
+
+		let (argvbuf, argv) = make_argv(&self.argv);
+		let (envpbuf, envp) = make_envp(&self.envp);
+
+		ubend_open((&argv).as_ptr(), (&envp).as_ptr(), &mut child, self.last)?;
+
+		// I hope these explicit drops ensure the lifetime of the buffers
+		// until this point, even with non-lexical lifetimes.
+		drop(argvbuf);
+		drop(envpbuf);
+
+		Ok(child)
+	}
 }
 
 fn make_ptr_array(buf: &Vec<u8>, len: usize) -> Vec<*const c_char> {
@@ -1263,10 +1343,10 @@ fn make_ptr_array(buf: &Vec<u8>, len: usize) -> Vec<*const c_char> {
 	ptrs
 }
 
-fn make_argv(argv: &Vec<String>) -> (Vec<u8>, Vec<*const c_char>) {
+fn make_argv<Str: AsRef<str>>(argv: &[Str]) -> (Vec<u8>, Vec<*const c_char>) {
 	let mut buf = Vec::<u8>::new();
 	for arg in argv {
-		buf.extend_from_slice(arg.as_bytes());
+		buf.extend_from_slice(arg.as_ref().as_bytes());
 		buf.push(0);
 	}
 
@@ -1292,9 +1372,9 @@ fn make_envp(vars: &HashMap<String, String>) -> (Vec<u8>, Vec<*const c_char>) {
 	let mut buf = Vec::<u8>::new();
 	let len = envp.len();
 	for (key, value) in envp {
-		buf.extend_from_slice(&key[..]);
+		buf.extend_from_slice(&key);
 		buf.push('=' as u8);
-		buf.extend_from_slice(&value[..]);
+		buf.extend_from_slice(&value);
 		buf.push(0);
 	}
 
@@ -1318,7 +1398,6 @@ impl Chain {
 			return Err(Error::NotEnoughPipes);
 		}
 
-		let mut prev_was_pipe = true;
 		for pipe in &pipes {
 			if pipe.argv.is_empty() {
 				return Err(Error::NotEnoughArguments);
@@ -1328,21 +1407,8 @@ impl Chain {
 				PipeSetup::Redirect(target) => {
 					return Err(Error::CannotRedirectStdinTo(target));
 				},
-				PipeSetup::Pipe => {
-					if !prev_was_pipe {
-						return Err(Error::InvalidPipeLinkup);
-					}
-				},
 				_ => {}
 			}
-
-			prev_was_pipe = match pipe.stdout {
-				PipeSetup::Pipe | PipeSetup::Redirect(Target::Stdout) => true,
-				_ => match pipe.stderr {
-					PipeSetup::Redirect(Target::Stdout) => true,
-					_ => false
-				}
-			};
 		}
 
 		let mut children = Vec::<Child>::with_capacity(len);
@@ -1365,18 +1431,18 @@ impl Chain {
 
 			if index > 0 && child.infd == PIPES_PIPE {
 				let prevfd = children[index - 1].outfd;
-				if prevfd >= 0 {
+				if prevfd > -1 {
 					child.infd = prevfd;
 					children[index - 1].outfd = -1;
-				} else {
-					child.infd = PIPES_INHERIT;
 				}
+				// Otherwise chain.stdin_at(index) has to be called by the API
+				// user in order to provide that particular stream with data.
 			}
 
 			let (argvbuf, argv) = make_argv(&pipe.argv);
 			let (envpbuf, envp) = make_envp(&pipe.envp);
 
-			let res = ubend_open((&argv[..]).as_ptr(), (&envp[..]).as_ptr(), &mut child, pipe.last);
+			let res = ubend_open((&argv).as_ptr(), (&envp).as_ptr(), &mut child, pipe.last);
 
 			// I hope these explicit drops ensure the lifetime of the buffers
 			// until this point, even with non-lexical lifetimes.
@@ -1460,11 +1526,11 @@ impl Chain {
 	}
 
 	pub fn children(&self) -> &[Child] {
-		&self.children[..]
+		&self.children
 	}
 
 	pub fn children_mut(&mut self) -> &mut [Child] {
-		&mut self.children[..]
+		&mut self.children
 	}
 
 	/// Wait for all child processes to finish.
