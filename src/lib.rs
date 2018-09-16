@@ -1,4 +1,4 @@
-//! # Pipes
+//! # UBend
 //!
 //! This is a small crate that lets you build pipe chains between spawned
 //! processes using a syntax similar to the Unix shell.
@@ -303,12 +303,12 @@ impl PipeSetup {
 
 	unsafe fn into_raw_fd(self) -> c_int {
 		match self {
-			PipeSetup::Inherit => PIPES_INHERIT,
-			PipeSetup::Pipe => PIPES_PIPE,
-			PipeSetup::Null => PIPES_NULL,
-			PipeSetup::Redirect(Target::Stdout) => PIPES_TO_STDOUT,
-			PipeSetup::Redirect(Target::Stderr) => PIPES_TO_STDERR,
-			PipeSetup::Temp => PIPES_TEMP,
+			PipeSetup::Inherit => UBEND_INHERIT,
+			PipeSetup::Pipe => UBEND_PIPE,
+			PipeSetup::Null => UBEND_NULL,
+			PipeSetup::Redirect(Target::Stdout) => UBEND_TO_STDOUT,
+			PipeSetup::Redirect(Target::Stderr) => UBEND_TO_STDERR,
+			PipeSetup::Temp => UBEND_TEMP,
 			PipeSetup::FileDescr(fd) => fd,
 			PipeSetup::FileName(name, mode) => {
 				let mut name = name.into_bytes();
@@ -329,7 +329,7 @@ impl PipeSetup {
 
 /// Configuration of a child process.
 #[derive(Debug)]
-pub struct Pipes {
+pub struct Command {
 	pub stdin:  PipeSetup,
 	pub stdout: PipeSetup,
 	pub stderr: PipeSetup,
@@ -641,7 +641,7 @@ macro_rules! ubend_internal {
 
 	// ========== BODY =========================================================
 	(@body () () (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($chain:tt)*)) => {
-		ubend_internal!(@chain (ubend::Pipes {
+		ubend_internal!(@chain (ubend::Command {
 			stdin: $($stdin)*,
 			stdout: $($stdout)*,
 			stderr: $($stderr)*,
@@ -661,7 +661,7 @@ macro_rules! ubend_internal {
 
 	(@body (|) ($($rest:tt)+) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($chain:tt)*)) => {
 		ubend_internal!(@chain
-			(ubend::Pipes {
+			(ubend::Command {
 				stdin: $($stdin)*,
 				stdout: $($stdout)*,
 				stderr: $($stderr)*,
@@ -829,18 +829,18 @@ fn redirect_fd(oldfd: c_int, newfd: c_int, errmsg: *const c_char) {
 
 fn redirect_out_fd(action: c_int, oldfd: c_int, newfd: c_int, errmsg: *const c_char) {
 	match action {
-		::PIPES_TO_STDOUT => redirect_fd(STDOUT_FILENO, newfd, errmsg),
-		::PIPES_TO_STDERR => redirect_fd(STDERR_FILENO, newfd, errmsg),
+		::UBEND_TO_STDOUT => redirect_fd(STDOUT_FILENO, newfd, errmsg),
+		::UBEND_TO_STDERR => redirect_fd(STDERR_FILENO, newfd, errmsg),
 		_                 => redirect_fd(oldfd, newfd, errmsg),
 	}
 }
 
-const PIPES_INHERIT:   c_int = -2;
-const PIPES_PIPE:      c_int = -3;
-const PIPES_NULL:      c_int = -4;
-const PIPES_TO_STDOUT: c_int = -5;
-const PIPES_TO_STDERR: c_int = -6;
-const PIPES_TEMP:      c_int = -7;
+const UBEND_INHERIT:   c_int = -2;
+const UBEND_PIPE:      c_int = -3;
+const UBEND_NULL:      c_int = -4;
+const UBEND_TO_STDOUT: c_int = -5;
+const UBEND_TO_STDERR: c_int = -6;
+const UBEND_TEMP:      c_int = -7;
 
 impl Child {
 	pub fn kill(&mut self, sig: c_int) -> result::Result<(), KillError> {
@@ -982,7 +982,7 @@ fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 		let erraction = child.errfd;
 
 		match inaction {
-			::PIPES_PIPE => {
+			::UBEND_PIPE => {
 				let mut pair: [c_int; 2] = [-1, -1];
 				if pipe2(pair.as_mut_ptr(), O_CLOEXEC) == -1 {
 					return handle_error(infd, outfd, errfd);
@@ -990,14 +990,14 @@ fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 				infd = pair[0];
 				child.infd = pair[1];
 			},
-			::PIPES_NULL => {
+			::UBEND_NULL => {
 				infd = open(cstr!(b"/dev/null\0"), O_RDONLY);
 
 				if infd < 0 {
 					return handle_error(infd, outfd, errfd);
 				}
 			},
-			::PIPES_TEMP => {
+			::UBEND_TEMP => {
 				infd = open_temp_fd();
 				child.infd = infd;
 
@@ -1005,7 +1005,7 @@ fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 					return handle_error(infd, outfd, errfd);
 				}
 			},
-			::PIPES_INHERIT => {},
+			::UBEND_INHERIT => {},
 			_ if inaction > -1 => {
 				infd = inaction;
 				child.infd = -1;
@@ -1017,7 +1017,7 @@ fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 		}
 
 		match outaction {
-			::PIPES_PIPE => {
+			::UBEND_PIPE => {
 				let mut pair: [c_int; 2] = [-1, -1];
 				if pipe2(pair.as_mut_ptr(), O_CLOEXEC) == -1 {
 					return handle_error(infd, outfd, errfd);
@@ -1025,15 +1025,15 @@ fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 				outfd = pair[1];
 				child.outfd = pair[0];
 			},
-			::PIPES_NULL => {
+			::UBEND_NULL => {
 				outfd = open(cstr!(b"/dev/null\0"), O_WRONLY);
 
 				if outfd < 0 {
 					return handle_error(infd, outfd, errfd);
 				}
 			},
-			::PIPES_TO_STDERR => {},
-			::PIPES_TEMP => {
+			::UBEND_TO_STDERR => {},
+			::UBEND_TEMP => {
 				outfd = open_temp_fd();
 				child.outfd = outfd;
 
@@ -1041,7 +1041,7 @@ fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 					return handle_error(infd, outfd, errfd);
 				}
 			},
-			::PIPES_INHERIT => {},
+			::UBEND_INHERIT => {},
 			_ if outaction > -1 => {
 				outfd = outaction;
 				child.outfd = -1;
@@ -1053,7 +1053,7 @@ fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 		}
 
 		match erraction {
-			::PIPES_PIPE => {
+			::UBEND_PIPE => {
 				let mut pair: [c_int; 2] = [-1, -1];
 				if pipe2(pair.as_mut_ptr(), O_CLOEXEC) == -1 {
 					return handle_error(infd, outfd, errfd);
@@ -1061,15 +1061,15 @@ fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 				errfd = pair[1];
 				child.errfd = pair[0];
 			},
-			::PIPES_NULL => {
+			::UBEND_NULL => {
 				errfd = open(cstr!(b"/dev/null\0"), O_WRONLY);
 
 				if errfd < 0 {
 					return handle_error(infd, outfd, errfd);
 				}
 			},
-			::PIPES_TO_STDOUT => {},
-			::PIPES_TEMP => {
+			::UBEND_TO_STDOUT => {},
+			::UBEND_TEMP => {
 				errfd = open_temp_fd();
 				child.errfd = errfd;
 
@@ -1077,7 +1077,7 @@ fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 					return handle_error(infd, outfd, errfd);
 				}
 			},
-			::PIPES_INHERIT => {},
+			::UBEND_INHERIT => {},
 			_ if erraction > -1 => {
 				errfd = erraction;
 				child.errfd = -1;
@@ -1135,18 +1135,18 @@ fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 			// parent
 			child.pid = pid;
 
-			if inaction  != PIPES_TEMP && infd  > -1 { close(infd); }
-			if outaction != PIPES_TEMP && outfd > -1 { close(outfd); }
-			if erraction != PIPES_TEMP && errfd > -1 { close(errfd); }
+			if inaction  != UBEND_TEMP && infd  > -1 { close(infd); }
+			if outaction != UBEND_TEMP && outfd > -1 { close(outfd); }
+			if erraction != UBEND_TEMP && errfd > -1 { close(errfd); }
 		}
 
 		Ok(())
 	}
 }
 
-impl Pipes {
+impl Command {
 	pub fn empty() -> Self {
-		Pipes {
+		Command {
 			stdin:  PipeSetup::Inherit,
 			stdout: PipeSetup::Inherit,
 			stderr: PipeSetup::Inherit,
@@ -1157,7 +1157,7 @@ impl Pipes {
 	}
 
 	pub fn new(prog: &str) -> Self {
-		Pipes {
+		Command {
 			stdin:  PipeSetup::Inherit,
 			stdout: PipeSetup::Inherit,
 			stderr: PipeSetup::Inherit,
@@ -1168,7 +1168,7 @@ impl Pipes {
 	}
 
 	pub fn first(args: &[&str]) -> Self {
-		Pipes {
+		Command {
 			stdin:  PipeSetup::Inherit,
 			stdout: PipeSetup::Pipe,
 			stderr: PipeSetup::Inherit,
@@ -1179,7 +1179,7 @@ impl Pipes {
 	}
 
 	pub fn last(args: &[&str]) -> Self {
-		Pipes {
+		Command {
 			stdin:  PipeSetup::Pipe,
 			stdout: PipeSetup::Inherit,
 			stderr: PipeSetup::Inherit,
@@ -1190,7 +1190,7 @@ impl Pipes {
 	}
 
 	pub fn pass_through(args: &[&str]) -> Self {
-		Pipes {
+		Command {
 			stdin:  PipeSetup::Pipe,
 			stdout: PipeSetup::Pipe,
 			stderr: PipeSetup::Inherit,
@@ -1201,7 +1201,7 @@ impl Pipes {
 	}
 
 	pub fn pass_stdin(fd: c_int, args: &[&str]) -> Self {
-		Pipes {
+		Command {
 			stdin:  PipeSetup::FileDescr(fd),
 			stdout: PipeSetup::Pipe,
 			stderr: PipeSetup::Inherit,
@@ -1212,7 +1212,7 @@ impl Pipes {
 	}
 
 	pub fn pass_stdout(fd: c_int, args: &[&str]) -> Self {
-		Pipes {
+		Command {
 			stdin:  PipeSetup::Pipe,
 			stdout: PipeSetup::FileDescr(fd),
 			stderr: PipeSetup::Inherit,
@@ -1223,7 +1223,7 @@ impl Pipes {
 	}
 
 	pub fn pass_stderr(fd: c_int, args: &[&str]) -> Self {
-		Pipes {
+		Command {
 			stdin:  PipeSetup::Pipe,
 			stdout: PipeSetup::Inherit,
 			stderr: PipeSetup::FileDescr(fd),
@@ -1304,12 +1304,12 @@ impl Pipes {
 			errfd: self.stderr.into_raw_fd()
 		}};
 
-		if child.outfd == PIPES_TO_STDOUT {
-			child.outfd = PIPES_PIPE;
+		if child.outfd == UBEND_TO_STDOUT {
+			child.outfd = UBEND_PIPE;
 		}
 
-		if child.errfd == PIPES_TO_STDERR {
-			child.errfd = PIPES_PIPE;
+		if child.errfd == UBEND_TO_STDERR {
+			child.errfd = UBEND_PIPE;
 		}
 
 		let (argvbuf, argv) = make_argv(&self.argv);
@@ -1392,7 +1392,7 @@ impl Chain {
 	}
 
 	/// Create a new pipe chain. This function is called by the [ubend!] macro.
-	pub fn new(pipes: Vec<Pipes>) -> Result<Self> {
+	pub fn new(pipes: Vec<Command>) -> Result<Self> {
 		let len = pipes.len();
 		if len == 0 {
 			return Err(Error::NotEnoughPipes);
@@ -1421,15 +1421,15 @@ impl Chain {
 				errfd: pipe.stderr.into_raw_fd()
 			}};
 
-			if child.outfd == PIPES_TO_STDOUT {
-				child.outfd = PIPES_PIPE;
+			if child.outfd == UBEND_TO_STDOUT {
+				child.outfd = UBEND_PIPE;
 			}
 
-			if child.errfd == PIPES_TO_STDERR {
-				child.errfd = PIPES_PIPE;
+			if child.errfd == UBEND_TO_STDERR {
+				child.errfd = UBEND_PIPE;
 			}
 
-			if index > 0 && child.infd == PIPES_PIPE {
+			if index > 0 && child.infd == UBEND_PIPE {
 				let prevfd = children[index - 1].outfd;
 				if prevfd > -1 {
 					child.infd = prevfd;
