@@ -1,4 +1,4 @@
-//! # UBend
+//! # U-Bend
 //!
 //! This is a small crate that lets you build pipe chains between spawned
 //! processes using a syntax similar to the Unix shell.
@@ -179,14 +179,14 @@ macro_rules! cstr {
 	}
 }
 
-/// Redirection target. Used with [PipeSetup].
+/// Redirection target. Used with [PipeSetup](enum.PipeSetup.html).
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum Target {
 	Stdout,
 	Stderr
 }
 
-/// File open mode. Used with [PipeSetup].
+/// File open mode. Used with [PipeSetup](enum.PipeSetup.html).
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum Mode {
 	Read,
@@ -211,7 +211,7 @@ pub enum PipeSetup {
 
 	/// Redirect this stream to the specified target stream. Only stdout and
 	/// stderr can be redirected this way and only to each other. If a stream
-	/// is redirected to itself it is equivalent to [PipeSetup::Pipe].
+	/// is redirected to itself it is equivalent to [PipeSetup::Pipe](enum.PipeSetup.html#variant.Pipe).
 	Redirect(Target),
 
 	/// Connect the stream to a temp file. If supported this is done via the
@@ -233,7 +233,7 @@ pub enum PipeSetup {
 	FileName(String, Mode),
 
 	/// Connect the stream to the specified file. Note that error or not any
-	/// passed file will be consumed (closed) by [Chain::new()].
+	/// passed file will be consumed (closed) by [Chain::new()](struct.Chain.html#method.new).
 	File(File)
 }
 
@@ -793,6 +793,111 @@ macro_rules! ubend_internal {
 }
 
 /// Create a pipe chain using a Unix shell like syntax.
+///
+/// This macro returns Result\<[Chain](struct.Chain.html)\>.
+///
+/// **Note:** In contrast to the Unix shell there is no significant white space
+/// in these macros. This means `ubend!(echo "foo">"out.txt")` is the same as
+/// `ubend!(echo "foo" > "out.txt")` and similar for all kinds of syntax.
+///
+/// ```
+/// # #[macro_use] extern crate ubend;
+/// 
+/// // Run a simple command, passing an argument:
+/// ubend!(echo "hello world");
+/// 
+/// // Pass an environment variable:
+/// ubend!(LANG="C" gcc "main.c");
+/// 
+/// // Pass an argument from a variable:
+/// let string = "hello world";
+/// ubend!(echo string);
+/// 
+/// // Command from a variable:
+/// let command = "echo";
+/// ubend!({command} "hello world");
+/// 
+/// // Arguments from an array/Vec/anything with an `.iter()` method:
+/// let args = ["hello", "world"];
+/// ubend!(echo args...);
+/// 
+/// // This can be mixed with other arguments:
+/// ubend!(echo "foo" args... string);
+/// 
+/// // Needed for convenient syntax for redirecting to/from files:
+/// use ubend::IntoPipeSetup;
+/// 
+/// // Write a file by name:
+/// ubend!(echo "hello world" >"out.txt");
+/// 
+/// // Append to a file:
+/// ubend!(echo "hello world" >>"out.txt");
+/// 
+/// // Read from a file:
+/// ubend!(cat <"tests/input.txt");
+/// 
+/// // Use file objects:
+/// use std::fs::File;
+/// let mut file = File::open("out.txt").expect("open failed");
+/// ubend!(echo "hello world" >file);
+/// 
+/// // Redirecting stderr to stdout:
+/// ubend!("./tests/stdio.sh" >&2);
+/// 
+/// // Multiple redirects work too, of course:
+/// ubend!("./tests/stdio.sh" <"tests/input.txt" 2>&1 1>"out.txt");
+/// 
+/// // Redirect output to a temporary file (the file will be deleted when closed):
+/// use ubend::PipeSetup::{*};
+/// 
+/// let mut chain = ubend!(echo >Temp).expect("spawn failed");
+/// chain.wait_last().expect("wait failed");
+/// let mut temp = chain.stdout().unwrap();
+/// 
+/// // You need to reset the stream manually before using:
+/// use std::io::{Seek, SeekFrom};
+/// temp.seek(SeekFrom::Start(0)).expect("seek failed");
+/// 
+/// // Rederect from/to `/dev/null`:
+/// ubend!(echo "hello world" >Null);
+/// 
+/// // Explicitely capture a stream:
+/// ubend!(echo "hello world" 0<Pipe 1>Pipe 2>Pipe);
+/// 
+/// // Other way to redirect stdout/stderr to stderr/stdout:
+/// use ubend::Target;
+/// ubend!(echo "hello world" >(Redirect(Target::Stderr)));
+/// ubend!(echo "hello world" 2>(Redirect(Target::Stdout)));
+/// // The extra ( ) are neccessary because otherwise it will be parsed as two
+/// // arguments `Redirect` and `(Target::Stdout)` by the macro and then will
+/// // cause an error in the generated code.
+/// 
+/// // Make a stream to be inherited from the calling process (instead of
+/// // capturing it in a pipe):
+/// ubend!(echo "hello world" >Inherit);
+/// 
+/// // Alternative way to supply a stream from a file by name:
+/// use ubend::Mode;
+/// ubend!(echo "hello world" >(FileName("out.txt".to_string(), Mode::Append)));
+/// 
+/// // Alternative way to supply a stream from a file object:
+/// let mut file = File::open("tests/input.txt").expect("open failed");
+/// ubend!(cat <(ubend::PipeSetup::File(file)));
+/// 
+/// // Now for the actual multi command piping:
+/// ubend!(
+/// 	cat <"tests/input.txt" |
+/// 	grep "spam" |
+/// 	wc "-l"
+/// );
+/// 
+/// ubend!(
+/// 	"./tests/stdio.sh" 2>&1 1>Null |
+/// 	wc "-c"
+/// );
+/// 
+/// ```
+
 #[macro_export]
 macro_rules! ubend {
 	($($tt:tt)*) => {
@@ -1534,7 +1639,8 @@ impl Chain {
 		Ok(())
 	}
 
-	/// Create a new pipe chain. This function is called by the [ubend!] macro.
+	/// Create a new pipe chain. This function is called by the
+	/// [ubend!()](macro.ubend.html) macro.
 	pub fn new(pipes: Vec<Command>) -> Result<Self> {
 		let len = pipes.len();
 		if len == 0 {
