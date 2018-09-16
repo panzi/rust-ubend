@@ -152,6 +152,13 @@ use libc::{
 	FD_CLOEXEC
 };
 
+const UBEND_INHERIT:   c_int = -2;
+const UBEND_PIPE:      c_int = -3;
+const UBEND_NULL:      c_int = -4;
+const UBEND_TO_STDOUT: c_int = -5;
+const UBEND_TO_STDERR: c_int = -6;
+const UBEND_TEMP:      c_int = -7;
+
 #[cfg(target_os = "macos")]
 #[inline]
 unsafe fn environ() -> *mut *const *const c_char {
@@ -835,13 +842,6 @@ fn redirect_out_fd(action: c_int, oldfd: c_int, newfd: c_int, errmsg: *const c_c
 	}
 }
 
-const UBEND_INHERIT:   c_int = -2;
-const UBEND_PIPE:      c_int = -3;
-const UBEND_NULL:      c_int = -4;
-const UBEND_TO_STDOUT: c_int = -5;
-const UBEND_TO_STDERR: c_int = -6;
-const UBEND_TEMP:      c_int = -7;
-
 impl Child {
 	pub fn kill(&mut self, sig: c_int) -> result::Result<(), KillError> {
 		if unsafe { kill(self.pid, sig) } == -1 {
@@ -935,6 +935,112 @@ impl Child {
 		}
 		self.errfd = -1;
 		Some(unsafe { File::from_raw_fd(fd) })
+	}
+
+	/// Close stdin of the child process, read its stdout and stderr (if
+	/// possible) and wait for the child process to finish.
+	pub fn output(mut self) -> result::Result<Output, OutputError> {
+		drop(self.stdin());
+		self.internal_output()
+	}
+
+	fn internal_output(&mut self) -> result::Result<Output, OutputError> {
+		let mut stdout = Vec::new();
+		let mut stderr = Vec::new();
+		match (self.stdout(), self.stderr()) {
+			(None, None) => {},
+			(Some(mut out), None) => {
+				match out.read_to_end(&mut stdout) {
+					Ok(_) => {},
+					Err(err) => {
+						return Err(OutputError::IO(err));
+					}
+				}
+			},
+			(None, Some(mut err)) => {
+				match err.read_to_end(&mut stdout) {
+					Ok(_) => {},
+					Err(err) => {
+						return Err(OutputError::IO(err));
+					}
+				}
+			},
+			(Some(mut out), Some(mut err)) => {
+				let mut buf = [0u8; BUFSIZ as usize];
+				let mut pollfds = [
+					pollfd {
+						fd: out.as_raw_fd(),
+						events: POLLIN,
+						revents: 0
+					},
+					pollfd {
+						fd: err.as_raw_fd(),
+						events: POLLIN,
+						revents: 0
+					}
+				];
+
+				while pollfds[0].events != 0 && pollfds[1].events != 0 {
+					let res = unsafe { poll(pollfds.as_mut_ptr(), 2, -1) };
+
+					if res < 0 {
+						return Err(OutputError::Pipe(Error::OS(unsafe { *__errno_location() })));
+					}
+
+					if pollfds[0].revents & POLLIN != 0 {
+						match out.read(&mut buf) {
+							Ok(size) => {
+								stdout.extend_from_slice(&mut buf[..size]);
+							},
+							Err(err) => {
+								return Err(OutputError::IO(err));
+							}
+						}
+					}
+
+					if pollfds[0].revents & (POLLERR | POLLHUP) != 0 {
+						pollfds[0].fd = -1;
+						pollfds[0].events = 0;
+					}
+
+					if pollfds[0].revents & POLLNVAL != 0 {
+						return Err(OutputError::Pipe(Error::OS(unsafe { *__errno_location() })));
+					}
+
+					if pollfds[1].revents & POLLIN != 0 {
+						match err.read(&mut buf) {
+							Ok(size) => {
+								stderr.extend_from_slice(&mut buf[..size]);
+							},
+							Err(err) => {
+								return Err(OutputError::IO(err));
+							}
+						}
+					}
+
+					if pollfds[1].revents & (POLLERR | POLLHUP) != 0 {
+						pollfds[1].fd = -1;
+						pollfds[1].events = 0;
+					}
+
+					if pollfds[1].revents & POLLNVAL != 0 {
+						return Err(OutputError::Pipe(Error::OS(unsafe { *__errno_location() })));
+					}
+
+					pollfds[0].revents = 0;
+					pollfds[1].revents = 0;
+				}
+			}
+		}
+
+		match self.wait() {
+			Err(err) => Err(OutputError::Wait(err)),
+			Ok(status) => Ok(Output {
+				status,
+				stdout,
+				stderr,
+			})
+		}
 	}
 }
 
@@ -1550,101 +1656,7 @@ impl Chain {
 	pub fn output(mut self) -> result::Result<Output, OutputError> {
 		drop(self.stdin());
 
-		let mut stdout = Vec::new();
-		let mut stderr = Vec::new();
-		match (self.stdout(), self.stderr()) {
-			(None, None) => {},
-			(Some(mut out), None) => {
-				match out.read_to_end(&mut stdout) {
-					Ok(_) => {},
-					Err(err) => {
-						return Err(OutputError::IO(err));
-					}
-				}
-			},
-			(None, Some(mut err)) => {
-				match err.read_to_end(&mut stdout) {
-					Ok(_) => {},
-					Err(err) => {
-						return Err(OutputError::IO(err));
-					}
-				}
-			},
-			(Some(mut out), Some(mut err)) => {
-				let mut buf = [0u8; BUFSIZ as usize];
-				let mut pollfds = [
-					pollfd {
-						fd: out.as_raw_fd(),
-						events: POLLIN,
-						revents: 0
-					},
-					pollfd {
-						fd: err.as_raw_fd(),
-						events: POLLIN,
-						revents: 0
-					}
-				];
-
-				while pollfds[0].events != 0 && pollfds[1].events != 0 {
-					let res = unsafe { poll(pollfds.as_mut_ptr(), 2, -1) };
-
-					if res < 0 {
-						return Err(OutputError::Pipe(Error::OS(unsafe { *__errno_location() })));
-					}
-
-					if pollfds[0].revents & POLLIN != 0 {
-						match out.read(&mut buf) {
-							Ok(size) => {
-								stdout.extend_from_slice(&mut buf[..size]);
-							},
-							Err(err) => {
-								return Err(OutputError::IO(err));
-							}
-						}
-					}
-
-					if pollfds[0].revents & (POLLERR | POLLHUP) != 0 {
-						pollfds[0].fd = -1;
-						pollfds[0].events = 0;
-					}
-
-					if pollfds[0].revents & POLLNVAL != 0 {
-						return Err(OutputError::Pipe(Error::OS(unsafe { *__errno_location() })));
-					}
-
-					if pollfds[1].revents & POLLIN != 0 {
-						match err.read(&mut buf) {
-							Ok(size) => {
-								stderr.extend_from_slice(&mut buf[..size]);
-							},
-							Err(err) => {
-								return Err(OutputError::IO(err));
-							}
-						}
-					}
-					
-					if pollfds[1].revents & (POLLERR | POLLHUP) != 0 {
-						pollfds[1].fd = -1;
-						pollfds[1].events = 0;
-					}
-
-					if pollfds[1].revents & POLLNVAL != 0 {
-						return Err(OutputError::Pipe(Error::OS(unsafe { *__errno_location() })));
-					}
-
-					pollfds[0].revents = 0;
-					pollfds[1].revents = 0;
-				}
-			}
-		}
-
-		match self.wait_last() {
-			Err(err) => Err(OutputError::Wait(err)),
-			Ok(status) => Ok(Output {
-				status,
-				stdout,
-				stderr,
-			})
-		}
+		let index = self.children.len() - 1;
+		self.children[index].internal_output()
 	}
 }
