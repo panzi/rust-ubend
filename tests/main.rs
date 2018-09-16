@@ -202,7 +202,7 @@ fn strange_setup() {
 	use ubend::PipeSetup::{*};
 
 	let mut chain = ubend!(
-		echo "hello world" <Inherit >Inherit |
+		echo "hello" "world" <Inherit >Inherit |
 		grep "spam" <Pipe |
 		wc "-l" <Pipe).expect("spawn failed");
 
@@ -217,4 +217,21 @@ fn strange_setup() {
 	let num = String::from_utf8(output.stdout).
 		expect("reading UTF-8 failed");
 	assert_eq!(num.trim(), "2");
+}
+
+#[test]
+fn command_as_var() {
+	let cmd = "echo";
+	assert_output!(ubend!({cmd} "hello world"), "hello world\n");
+}
+
+#[test]
+fn spread_args() {
+	let args = ["foo", "bar", "baz"];
+	assert_output!(ubend!(echo "egg" args... "bacon"), "egg foo bar baz bacon\n");
+
+	let vec_args = vec!["foo", "bar", "baz"];
+	assert_output!(ubend!(echo "egg" vec_args... "bacon"), "egg foo bar baz bacon\n");
+
+	assert_output!(ubend!(echo "egg" ["foo", "bar", "baz"]... "bacon"), "egg foo bar baz bacon\n");
 }

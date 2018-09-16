@@ -586,6 +586,39 @@ macro_rules! ubend_internal_envp {
 
 #[macro_export]
 #[doc(hidden)]
+macro_rules! ubend_internal_argv2 {
+	($argv:ident ($($code:tt)*)) => {
+		$($code)*
+	};
+
+	($argv:ident ($($code:tt)*) (@spread $arg:expr) $($rest:tt)*) => {
+		ubend_internal_argv2!($argv ({
+			$($code)*
+			for arg in $arg.iter() {
+				($argv).push(arg.to_string());
+			}
+		}) $($rest)*)
+	};
+
+	($argv:ident ($($code:tt)*) ($($arg:tt)*) $($rest:tt)*) => {
+		ubend_internal_argv2!($argv ({$($code)* ($argv).push(($($arg)*).to_string());}) $($rest)*)
+	}
+}
+
+#[macro_export]
+#[doc(hidden)]
+macro_rules! ubend_internal_argv {
+	($($argv:tt)*) => {
+		{
+			let mut argv = Vec::<String>::new();
+			{ ubend_internal_argv2!(argv () $($argv)*) }
+			argv
+		}
+	}
+}
+
+#[macro_export]
+#[doc(hidden)]
 macro_rules! ubend_internal {
 	(stdin ($($stream:tt)*) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($cont:tt)*) ($($chain:tt)*)) => {
 		ubend_internal!($($cont)* (($($stream)*) ($($stdout)*) ($($stderr)*) ($($last)*) ($($argv)*) ($($envp)*)) ($($chain)*))
@@ -653,7 +686,7 @@ macro_rules! ubend_internal {
 			stdout: $($stdout)*,
 			stderr: $($stderr)*,
 			last: $($last)*,
-			argv: vec![$($argv.to_string()),*],
+			argv: ubend_internal_argv!($($argv)*),
 			envp: ubend_internal_envp!($($envp)*)
 		}) ($($chain)*) (@end))
 	};
@@ -673,12 +706,16 @@ macro_rules! ubend_internal {
 				stdout: $($stdout)*,
 				stderr: $($stderr)*,
 				last: $($last)*,
-				argv: vec![$($argv.to_string()),*],
+				argv: ubend_internal_argv!($($argv)*),
 				envp: ubend_internal_envp!($($envp)*)
 			})
 			($($chain)*)
 			(@head () ($($rest)+) ((ubend::PipeSetup::Pipe) (ubend::PipeSetup::Pipe) (ubend::PipeSetup::Inherit) (ubend::Target::Stderr) () ()))
 		)
+	};
+
+	(@body ($($arr:tt)*) (... $($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
+		ubend_internal!(@arg (@spread $($arr)*) ($($rest)*) ($($opts)*) ($($chain)*))
 	};
 
 	(@body (<) ($($rest:tt)*) ($($opts:tt)*) ($($chain:tt)*)) => {
