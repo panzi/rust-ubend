@@ -82,10 +82,10 @@ use std::os::unix::io::{FromRawFd, IntoRawFd, AsRawFd};
 use std::collections::HashMap;
 use std::ffi::{CStr};
 use std::fmt::Display;
-use std::fs::File;
+use std::fs::{File};
 use std::ptr;
 use std::env;
-use std::mem::drop;
+use std::mem::{drop};
 use std::io::Read;
 
 use libc::{
@@ -95,6 +95,7 @@ use libc::{
 	perror,
 	open,
 	close,
+	dup,
 	dup2,
 	pid_t,
 	execvp,
@@ -135,6 +136,11 @@ use libc::{
 	EINTR,
 	EPERM,
 	ESRCH,
+	EFAULT,
+	EACCES,
+	EEXIST,
+	ENOTDIR,
+	EBADF,
 	EXIT_FAILURE,
 	STDIN_FILENO,
 	STDOUT_FILENO,
@@ -151,13 +157,6 @@ use libc::{
 	F_SETFD,
 	FD_CLOEXEC
 };
-
-const UBEND_INHERIT:   c_int = -2;
-const UBEND_PIPE:      c_int = -3;
-const UBEND_NULL:      c_int = -4;
-const UBEND_TO_STDOUT: c_int = -5;
-const UBEND_TO_STDERR: c_int = -6;
-const UBEND_TEMP:      c_int = -7;
 
 #[cfg(target_os = "macos")]
 #[inline]
@@ -224,11 +223,6 @@ pub enum PipeSetup {
 	/// using `mkstemp()` and then immediately `unlink()`ed.
 	Temp,
 
-	/// Connect the stream to the specified file descriptor. Note that error
-	/// or not any passed file descriptor will be consumed (closed) by
-	/// [Chain::new()].
-	FileDescr(c_int),
-
 	/// Connect the stream to the specified file using the specified mode.
 	FileName(String, Mode),
 
@@ -282,7 +276,7 @@ impl PipeSetup {
 
 	pub fn is_any_file(&self) -> bool {
 		match self {
-			PipeSetup::File(_) | PipeSetup::FileDescr(_) | PipeSetup::FileName(_, _) => true,
+			PipeSetup::File(_) | PipeSetup::FileName(_, _) => true,
 			_ => false
 		}
 	}
@@ -294,57 +288,240 @@ impl PipeSetup {
 		}
 	}
 
-	pub fn is_file_descr(&self) -> bool {
-		match self {
-			PipeSetup::FileDescr(_) => true,
-			_ => false
-		}
-	}
-
 	pub fn is_file_name(&self) -> bool {
 		match self {
 			PipeSetup::FileName(_, _) => true,
 			_ => false
 		}
 	}
+}
 
-	unsafe fn into_raw_fd(self) -> c_int {
-		match self {
-			PipeSetup::Inherit => UBEND_INHERIT,
-			PipeSetup::Pipe => UBEND_PIPE,
-			PipeSetup::Null => UBEND_NULL,
-			PipeSetup::Redirect(Target::Stdout) => UBEND_TO_STDOUT,
-			PipeSetup::Redirect(Target::Stderr) => UBEND_TO_STDERR,
-			PipeSetup::Temp => UBEND_TEMP,
-			PipeSetup::FileDescr(fd) => fd,
-			PipeSetup::FileName(name, mode) => {
-				let mut name = name.into_bytes();
-				name.push(0);
+#[derive(Debug)]
+enum InternalSetup {
+	Inherit,
+	InPipe,
+	Pipe(c_int, c_int),
+	File(c_int),
+	Temp(c_int)
+}
 
-				let fd = match mode {
-					Mode::Read   => open(cstr!(name), O_RDONLY),
-					Mode::Write  => open(cstr!(name), O_WRONLY | O_CREAT | O_TRUNC,  S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH),
-					Mode::Append => open(cstr!(name), O_WRONLY | O_CREAT | O_APPEND, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH),
+impl InternalSetup {
+	fn pipe() -> std::io::Result<Self> {
+		let mut pair: [c_int; 2] = [-1, -1];
+		unsafe {
+			if pipe2(pair.as_mut_ptr(), O_CLOEXEC) == -1 {
+				let errno = *__errno_location();
+				let kind = match errno {
+					::EFAULT => std::io::ErrorKind::InvalidInput,
+					::EINVAL => std::io::ErrorKind::InvalidInput,
+					_        => std::io::ErrorKind::Other
 				};
-
-				fd
+				return Err(std::io::Error::new(kind, strerror(errno)));
 			}
-			PipeSetup::File(file) => file.into_raw_fd()
+		}
+		Ok(InternalSetup::Pipe(pair[0], pair[1]))
+	}
+
+	fn null(mode: Mode) -> std::io::Result<Self> {
+		InternalSetup::open("/dev/null", mode)
+	}
+
+	fn open(name: &str, mode: Mode) -> std::io::Result<Self> {
+		unsafe {
+			let fd = match mode {
+				Mode::Read   => open(cstr!(name), O_RDONLY),
+				Mode::Write  => open(cstr!(name), O_WRONLY | O_CREAT | O_TRUNC,  S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH),
+				Mode::Append => open(cstr!(name), O_WRONLY | O_CREAT | O_APPEND, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH),
+			};
+			if fd < 0 {
+				let errno = *__errno_location();
+				let kind = match errno {
+					::ENOENT  => std::io::ErrorKind::NotFound,
+					::EACCES  => std::io::ErrorKind::PermissionDenied,
+					::EPERM   => std::io::ErrorKind::PermissionDenied,
+					::EEXIST  => std::io::ErrorKind::AlreadyExists,
+					::EINTR   => std::io::ErrorKind::Interrupted,
+					::EINVAL  => std::io::ErrorKind::InvalidInput,
+					::EISDIR  => std::io::ErrorKind::InvalidInput,
+					::ENOTDIR => std::io::ErrorKind::InvalidInput,
+					_         => std::io::ErrorKind::Other
+				};
+				return Err(std::io::Error::new(kind, strerror(errno)));
+			}
+
+			Ok(InternalSetup::File(fd))
+		}
+	}
+
+	fn temp() -> std::io::Result<Self> {
+		unsafe {
+			let fd = open_temp_fd();
+			if fd < 0 {
+				let errno = *__errno_location();
+				let kind = match errno {
+					::ENOENT  => std::io::ErrorKind::NotFound,
+					::EACCES  => std::io::ErrorKind::PermissionDenied,
+					::EPERM   => std::io::ErrorKind::PermissionDenied,
+					::EEXIST  => std::io::ErrorKind::AlreadyExists,
+					::EINTR   => std::io::ErrorKind::Interrupted,
+					::EINVAL  => std::io::ErrorKind::InvalidInput,
+					::EISDIR  => std::io::ErrorKind::InvalidInput,
+					::ENOTDIR => std::io::ErrorKind::InvalidInput,
+					_         => std::io::ErrorKind::Other
+				};
+				return Err(std::io::Error::new(kind, strerror(errno)));
+			}
+
+			Ok(InternalSetup::Temp(fd))
+		}
+	}
+
+	fn dup(fd: c_int) -> std::io::Result<InternalSetup> {
+		unsafe {
+			let fd2 = dup(fd);
+			if fd2 < 0 {
+				let errno = *__errno_location();
+				let kind = match errno {
+					::EINVAL => std::io::ErrorKind::InvalidInput,
+					::EBADF  => std::io::ErrorKind::InvalidInput,
+					::EINTR  => std::io::ErrorKind::Interrupted,
+					_        => std::io::ErrorKind::Other
+				};
+				return Err(std::io::Error::new(kind, strerror(errno)));
+			}
+			Ok(InternalSetup::File(fd2))
+		}
+	}
+
+	fn try_clone(&self) -> std::io::Result<InternalSetup> {
+		match self {
+			InternalSetup::Inherit => Ok(InternalSetup::Inherit),
+			InternalSetup::InPipe  => Ok(InternalSetup::InPipe),
+			InternalSetup::Pipe(_fd1, fd2) => InternalSetup::dup(*fd2),
+			InternalSetup::File(fd) => InternalSetup::dup(*fd),
+			InternalSetup::Temp(fd) => InternalSetup::dup(*fd),
+		}
+	}
+
+	/// -> (for_parent, for_child)
+	fn as_fd_pair(&self, default_fd: c_int) -> (c_int, c_int) {
+		match self {
+			InternalSetup::Inherit => (-1, default_fd),
+			InternalSetup::InPipe  => (-1, default_fd),
+			InternalSetup::Pipe(fd1, fd2) => (*fd1, *fd2),
+			InternalSetup::File(fd) => (-1, *fd),
+			InternalSetup::Temp(fd) => (*fd, *fd),
+		}
+	}
+
+	fn drop_as_parent(mut self) {
+		match self {
+			InternalSetup::Inherit => {},
+			InternalSetup::InPipe  => {},
+			InternalSetup::Pipe(ref mut parent_fd, _) => {
+				*parent_fd = -1;
+			},
+			InternalSetup::File(_) => {},
+			InternalSetup::Temp(ref mut both_fd) => {
+				*both_fd = -1;
+			},
+		}
+	}
+
+	#[allow(dead_code)]
+	fn drop_as_child(mut self) {
+		match self {
+			InternalSetup::Inherit => {},
+			InternalSetup::InPipe  => {},
+			InternalSetup::Pipe(_, ref mut child_fd) => {
+				*child_fd = -1;
+			},
+			InternalSetup::File(ref mut child_fd) => {
+				*child_fd = -1;
+			},
+			InternalSetup::Temp(ref mut both_fd) => {
+				*both_fd = -1;
+			},
+		}
+	}
+
+	#[allow(dead_code)]
+	fn is_inherit(&self) -> bool {
+		match self {
+			InternalSetup::Inherit => true,
+			_ => false
+		}
+	}
+
+	#[allow(dead_code)]
+	fn is_in_pipe(&self) -> bool {
+		match self {
+			InternalSetup::InPipe => true,
+			_ => false
+		}
+	}
+
+	#[allow(dead_code)]
+	fn is_pipe(&self) -> bool {
+		match self {
+			InternalSetup::Pipe(_, _) => true,
+			_ => false
+		}
+	}
+
+	#[allow(dead_code)]
+	fn is_file(&self) -> bool {
+		match self {
+			InternalSetup::File(_) => true,
+			_ => false
+		}
+	}
+
+	#[allow(dead_code)]
+	fn is_temp(&self) -> bool {
+		match self {
+			InternalSetup::Temp(_) => true,
+			_ => false
 		}
 	}
 }
 
-/// Configuration of a child process.
-#[derive(Debug)]
-pub struct Command {
-	pub stdin:  PipeSetup,
-	pub stdout: PipeSetup,
-	pub stderr: PipeSetup,
-	pub last: Target,
-	pub argv: Vec<String>,
-	pub envp: HashMap<String, String>
+impl Drop for InternalSetup {
+	fn drop(&mut self) {
+		match self {
+			InternalSetup::Inherit => {},
+			InternalSetup::InPipe  => {},
+			InternalSetup::Pipe(fd1, fd2) => {
+				unsafe {
+					if *fd1 > -1 { close(*fd1); }
+					if *fd2 > -1 { close(*fd2); }
+				}
+			},
+			InternalSetup::File(fd) => {
+				unsafe {
+					if *fd > -1 { close(*fd); }
+				}
+			},
+			InternalSetup::Temp(fd) => {
+				unsafe {
+					if *fd > -1 { close(*fd); }
+				}
+			}
+		}
+	}
 }
 
+/// Configuration of a child process that is to be started.
+#[derive(Debug)]
+pub struct Command {
+	stdin:  InternalSetup,
+	stdout: InternalSetup,
+	stderr: InternalSetup,
+	argv: Vec<String>,
+	envp: HashMap<String, String>
+}
+
+/// A running child process.
 #[derive(Debug)]
 pub struct Child {
 	pid:   pid_t,
@@ -353,15 +530,21 @@ pub struct Child {
 	errfd: c_int,
 }
 
-/// Represents a pipe chain.
+/// A pipe chain of child processes.
 #[derive(Debug)]
 pub struct Chain {
 	children: Vec<Child>
 }
 
+/// Errors of opening a pipe chain.
 pub enum Error {
 	/// A libc function returned an error of specified `errno`.
+	///
+	/// **Note:** This might change to abstract out the `errno` and unroll the
+	/// possible errors into this enum.
 	OS(c_int),
+
+	IO(std::io::Error),
 
 	/// Any command needs to have at least one "argument" (the command name).
 	NotEnoughArguments,
@@ -374,22 +557,41 @@ pub enum Error {
 	NotEnoughPipes,
 }
 
+/// Errors of waiting for a child process to finish.
 pub enum WaitError {
+	/// Unblocked signal or `SIGCHLD` was caught.
 	Interrupted,
+
+	/// No process with given pid exists or it's not a child of the calling process.
 	ChildInvalid,
-	ChildSignaled(c_int),
-	ChildCoreDumped,
+
+	/// Child process was terminated by given signal.
+	/// If the second argument is true the child process' core was dumped.
+	ChildSignaled(c_int, bool),
+
+	/// Child process was stopped by given signal.
 	ChildStopped(c_int),
+
+	/// Child process was resumed by delivery of `SIGCONT`.
 	ChildContinued,
 }
 
+/// Errors of getting the output of a child.
 pub enum OutputError {
 	/// A Rust io function returned the specified error.
 	IO(std::io::Error),
-	Pipe(Error),
+
+	/// A libc function returned an error of specified `errno`.
+	///
+	/// **Note:** This might change to abstract out the `errno` and unroll the
+	/// possible errors into this enum.
+	OS(c_int),
+
+	/// Error occured while waiting.
 	Wait(WaitError)
 }
 
+/// Errors of sening a signal to a child process.
 pub enum KillError {
 	InvalidSignal,
 	NoPermissions,
@@ -407,6 +609,11 @@ pub type Result<T> = result::Result<T, Error>;
 
 pub type WaitResult = result::Result<c_int, WaitError>;
 
+/// Trait for redirect targets/sources in [ubend!()](macro.ubend.html) syntax.
+///
+/// In order for it to be possible to use a String, str or File all the same as
+/// a redirection target/source we need a common trait implemented by all of
+/// those.
 pub trait IntoPipeSetup {
 	fn into_pipe_setup(self, mode: Mode) -> PipeSetup;
 }
@@ -447,7 +654,15 @@ impl IntoPipeSetup for File {
 	}
 }
 
-fn fmt_os_error(errno: c_int, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
+fn strerror(errno: c_int) -> String {
+	let mut buf = String::new();
+	match fmt_os_error(errno, &mut buf) {
+		Err(_) => "(error formatting OS error message)".to_string(),
+		Ok(_)  => buf
+	}
+}
+
+fn fmt_os_error(errno: c_int, f: &mut std::fmt::Write) -> std::result::Result<(), std::fmt::Error> {
 	write!(f, "OS error code {}: ", errno)?;
 
 	let mut buf = [0u8; BUFSIZ as usize];
@@ -489,6 +704,7 @@ impl Display for Error {
 	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
 		match self {
 			Error::OS(errno) => fmt_os_error(*errno, f),
+			Error::IO(err) => err.fmt(f),
 			Error::NotEnoughArguments => f.write_str("not enough arguments (need at least one)"),
 			Error::CannotRedirectStdinTo(Target::Stdout) => f.write_str("cannot redirect stdin to stdout"),
 			Error::CannotRedirectStdinTo(Target::Stderr) => f.write_str("cannot redirect stdin to stderr"),
@@ -502,9 +718,14 @@ impl Display for WaitError {
 		match self {
 			WaitError::Interrupted => f.write_str("wait was interrupted"),
 			WaitError::ChildInvalid => f.write_str("process does not exist or is not a child of calling process"),
-			WaitError::ChildSignaled(sig) => write!(f, "child exited with signal: {}", sig),
-			WaitError::ChildCoreDumped => f.write_str("child core dumped"),
-			WaitError::ChildStopped(sig) => write!(f, "child stopped with signal: {}", sig),
+			WaitError::ChildSignaled(sig, dumped) => {
+				write!(f, "child exited with signal {}", sig)?;
+				if *dumped {
+					f.write_str(" and dumped it's core")?;
+				}
+				Ok(())
+			},
+			WaitError::ChildStopped(sig) => write!(f, "child stopped with signal {}", sig),
 			WaitError::ChildContinued => f.write_str("child continued"),
 		}
 	}
@@ -514,7 +735,7 @@ impl Display for OutputError {
 	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
 		match self {
 			OutputError::IO(err)   => err.fmt(f),
-			OutputError::Pipe(err) => err.fmt(f),
+			OutputError::OS(errno) => fmt_os_error(*errno, f),
 			OutputError::Wait(err) => err.fmt(f)
 		}
 	}
@@ -556,6 +777,17 @@ impl std::fmt::Debug for KillError {
 
 #[macro_export]
 #[doc(hidden)]
+macro_rules! ubend_try {
+	($($tt:tt)*) => {
+		match ($($tt)*) {
+			Ok(()) => {},
+			Err(err) => break Err(ubend::Error::IO(err)),
+		}
+	}
+}
+
+#[macro_export]
+#[doc(hidden)]
 macro_rules! ubend_unexpected_end {
 	($tt:tt) => {}
 }
@@ -577,9 +809,9 @@ macro_rules! ubend_illegal_mode {
 macro_rules! ubend_internal_envp {
 	($((($($key:tt)*) ($($val:tt)*)))*) => {
 		{
-			let mut envp = std::collections::HashMap::new();
-			$(envp.insert($($key)*.to_string(), $($val)*.to_string());)*
-			envp
+			let mut __envp = std::collections::HashMap::new();
+			$(__envp.insert($($key)*.to_string(), $($val)*.to_string());)*
+			__envp
 		}
 	}
 }
@@ -610,9 +842,9 @@ macro_rules! ubend_internal_argv2 {
 macro_rules! ubend_internal_argv {
 	($($argv:tt)*) => {
 		{
-			let mut argv = Vec::<String>::new();
-			{ ubend_internal_argv2!(argv () $($argv)*) }
-			argv
+			let mut __argv = Vec::<String>::new();
+			{ ubend_internal_argv2!(__argv () $($argv)*) }
+			__argv
 		}
 	}
 }
@@ -681,13 +913,19 @@ macro_rules! ubend_internal {
 
 	// ========== BODY =========================================================
 	(@body () () (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($chain:tt)*)) => {
-		ubend_internal!(@chain (ubend::Command {
-			stdin: $($stdin)*,
-			stdout: $($stdout)*,
-			stderr: $($stderr)*,
-			last: $($last)*,
-			argv: ubend_internal_argv!($($argv)*),
-			envp: ubend_internal_envp!($($envp)*)
+		ubend_internal!(@chain ({
+			let mut __command = ubend::Command::from_argv_and_envp(
+				ubend_internal_argv!($($argv)*),
+				ubend_internal_envp!($($envp)*));
+			ubend_try!{ __command.stdin($($stdin)*) }
+			if $($last)* == ubend::Target::Stderr {
+				ubend_try!{ __command.stdout($($stdout)*) }
+				ubend_try!{ __command.stderr($($stderr)*) }
+			} else {
+				ubend_try!{ __command.stdout($($stderr)*) }
+				ubend_try!{ __command.stderr($($stdout)*) }
+			}
+			__command
 		}) ($($chain)*) (@end))
 	};
 
@@ -701,13 +939,19 @@ macro_rules! ubend_internal {
 
 	(@body (|) ($($rest:tt)+) (($($stdin:tt)*) ($($stdout:tt)*) ($($stderr:tt)*) ($($last:tt)*) ($($argv:tt)*) ($($envp:tt)*)) ($($chain:tt)*)) => {
 		ubend_internal!(@chain
-			(ubend::Command {
-				stdin: $($stdin)*,
-				stdout: $($stdout)*,
-				stderr: $($stderr)*,
-				last: $($last)*,
-				argv: ubend_internal_argv!($($argv)*),
-				envp: ubend_internal_envp!($($envp)*)
+			({
+				let mut __command = ubend::Command::from_argv_and_envp(
+					ubend_internal_argv!($($argv)*),
+					ubend_internal_envp!($($envp)*));
+				ubend_try!{ __command.stdin($($stdin)*) }
+				if $($last)* == ubend::Target::Stderr {
+					ubend_try!{ __command.stdout($($stdout)*) }
+					ubend_try!{ __command.stderr($($stderr)*) }
+				} else {
+					ubend_try!{ __command.stdout($($stderr)*) }
+					ubend_try!{ __command.stderr($($stdout)*) }
+				}
+				__command
 			})
 			($($chain)*)
 			(@head () ($($rest)+) ((ubend::PipeSetup::Pipe) (ubend::PipeSetup::Pipe) (ubend::PipeSetup::Inherit) (ubend::Target::Stderr) () ()))
@@ -897,13 +1141,16 @@ macro_rules! ubend_internal {
 /// );
 /// 
 /// ```
-
 #[macro_export]
 macro_rules! ubend {
 	($($tt:tt)*) => {
-		ubend::Chain::new(
-			// arguments: @marker (current token) (tokens to parse) ((stdin) (stdout) (stderr) (last) (argv) (envp)) (pipe chain array)
-			ubend_internal!(@head () ($($tt)*) ((ubend::PipeSetup::Inherit) (ubend::PipeSetup::Pipe) (ubend::PipeSetup::Inherit) (ubend::Target::Stderr) () ()) ()))
+		loop {
+			break ubend::Chain::new(
+				// arguments: @marker (current token) (tokens to parse) ((stdin) (stdout) (stderr) (last) (argv) (envp)) (pipe chain array)
+				ubend_internal!(@head () ($($tt)*)
+					((ubend::PipeSetup::Inherit) (ubend::PipeSetup::Pipe) (ubend::PipeSetup::Inherit) (ubend::Target::Stderr)
+					() ()) ()));
+		}
 	}
 }
 
@@ -976,15 +1223,8 @@ fn redirect_fd(oldfd: c_int, newfd: c_int, errmsg: *const c_char) {
 	}
 }
 
-fn redirect_out_fd(action: c_int, oldfd: c_int, newfd: c_int, errmsg: *const c_char) {
-	match action {
-		::UBEND_TO_STDOUT => redirect_fd(STDOUT_FILENO, newfd, errmsg),
-		::UBEND_TO_STDERR => redirect_fd(STDERR_FILENO, newfd, errmsg),
-		_                 => redirect_fd(oldfd, newfd, errmsg),
-	}
-}
-
 impl Child {
+	/// Send a signal to the child process.
 	pub fn kill(&mut self, sig: c_int) -> result::Result<(), KillError> {
 		if unsafe { kill(self.pid, sig) } == -1 {
 			return match unsafe { *__errno_location() } {
@@ -997,6 +1237,7 @@ impl Child {
 		Ok(())
 	}
 
+	/// Wait for the child process to finish and get it's exit status.
 	pub fn wait(&mut self) -> WaitResult {
 		if self.pid <= 0 {
 			return Err(WaitError::ChildInvalid);
@@ -1018,11 +1259,9 @@ impl Child {
 		}
 
 		if unsafe { WIFSIGNALED(status) } {
-			return Err(WaitError::ChildSignaled(unsafe { WTERMSIG(status) }));
-		}
-
-		if unsafe { WCOREDUMP(status) } {
-			return Err(WaitError::ChildCoreDumped);
+			return Err(WaitError::ChildSignaled(
+				unsafe { WTERMSIG(status) },
+				unsafe { WCOREDUMP(status) }));
 		}
 
 		if unsafe { WIFSTOPPED(status) } {
@@ -1036,6 +1275,10 @@ impl Child {
 		return Err(WaitError::ChildInvalid);
 	}
 
+	/// Get the childs process ID.
+	///
+	/// If the process already ended and was waited for via
+	/// [wait()](struct.Child.html#method.wait) this will return `-1`.
 	pub fn pid(&self) -> pid_t {
 		self.pid
 	}
@@ -1043,7 +1286,7 @@ impl Child {
 	/// Take ownership of stdin of the process.
 	///
 	/// If the setup didn't create a pipe for stdin or the pipe was already
-	// taken this function returns None.
+	/// taken this function returns None.
 	pub fn stdin(&mut self) -> Option<File> {
 		let fd = self.infd;
 		if fd < 0 {
@@ -1056,7 +1299,7 @@ impl Child {
 	/// Take ownership of stdout of the process.
 	///
 	/// If the setup didn't create a pipe for stdout or the pipe was already
-	// taken this function returns None.
+	/// taken this function returns None.
 	pub fn stdout(&mut self) -> Option<File> {
 		let fd = self.outfd;
 		if fd < 0 {
@@ -1069,7 +1312,7 @@ impl Child {
 	/// Take ownership of stderr of the process.
 	///
 	/// If the setup didn't create a pipe for stderr or the pipe was already
-	// taken this function returns None.
+	/// taken this function returns None.
 	pub fn stderr(&mut self) -> Option<File> {
 		let fd = self.errfd;
 		if fd < 0 {
@@ -1126,7 +1369,7 @@ impl Child {
 					let res = unsafe { poll(pollfds.as_mut_ptr(), 2, -1) };
 
 					if res < 0 {
-						return Err(OutputError::Pipe(Error::OS(unsafe { *__errno_location() })));
+						return Err(OutputError::OS(unsafe { *__errno_location() }));
 					}
 
 					if pollfds[0].revents & POLLIN != 0 {
@@ -1146,7 +1389,7 @@ impl Child {
 					}
 
 					if pollfds[0].revents & POLLNVAL != 0 {
-						return Err(OutputError::Pipe(Error::OS(unsafe { *__errno_location() })));
+						return Err(OutputError::OS(unsafe { *__errno_location() }));
 					}
 
 					if pollfds[1].revents & POLLIN != 0 {
@@ -1166,7 +1409,7 @@ impl Child {
 					}
 
 					if pollfds[1].revents & POLLNVAL != 0 {
-						return Err(OutputError::Pipe(Error::OS(unsafe { *__errno_location() })));
+						return Err(OutputError::OS(unsafe { *__errno_location() }));
 					}
 
 					pollfds[0].revents = 0;
@@ -1207,169 +1450,19 @@ impl Drop for Child {
 	}
 }
 
-fn handle_error(infd: c_int, outfd: c_int, errfd: c_int) -> Result<()> {
+fn ubend_spawn(argv: *const *const c_char, envp: *const *const c_char, stdin: c_int, stdout: c_int, stderr: c_int) -> Result<pid_t> {
 	unsafe {
-		let errno = *__errno_location();
-
-		if infd  > -1 { close(infd); }
-		if outfd > -1 { close(outfd); }
-		if errfd > -1 { close(errfd); }
-
-		return Err(Error::OS(errno));
-	}
-}
-
-fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mut Child, last: Target) -> Result<()> {
-	unsafe {
-		let mut infd  = -1;
-		let mut outfd = -1;
-		let mut errfd = -1;
-
-		let inaction  = child.infd;
-		let outaction = child.outfd;
-		let erraction = child.errfd;
-
-		match inaction {
-			::UBEND_PIPE => {
-				let mut pair: [c_int; 2] = [-1, -1];
-				if pipe2(pair.as_mut_ptr(), O_CLOEXEC) == -1 {
-					return handle_error(infd, outfd, errfd);
-				}
-				infd = pair[0];
-				child.infd = pair[1];
-			},
-			::UBEND_NULL => {
-				infd = open(cstr!(b"/dev/null\0"), O_RDONLY);
-
-				if infd < 0 {
-					return handle_error(infd, outfd, errfd);
-				}
-			},
-			::UBEND_TEMP => {
-				infd = open_temp_fd();
-				child.infd = infd;
-
-				if infd < 0 {
-					return handle_error(infd, outfd, errfd);
-				}
-			},
-			::UBEND_INHERIT => {},
-			_ if inaction > -1 => {
-				infd = inaction;
-				child.infd = -1;
-			},
-			_ => {
-				*__errno_location() = EINVAL;
-				return handle_error(infd, outfd, errfd);
-			}
-		}
-
-		match outaction {
-			::UBEND_PIPE => {
-				let mut pair: [c_int; 2] = [-1, -1];
-				if pipe2(pair.as_mut_ptr(), O_CLOEXEC) == -1 {
-					return handle_error(infd, outfd, errfd);
-				}
-				outfd = pair[1];
-				child.outfd = pair[0];
-			},
-			::UBEND_NULL => {
-				outfd = open(cstr!(b"/dev/null\0"), O_WRONLY);
-
-				if outfd < 0 {
-					return handle_error(infd, outfd, errfd);
-				}
-			},
-			::UBEND_TO_STDERR => {},
-			::UBEND_TEMP => {
-				outfd = open_temp_fd();
-				child.outfd = outfd;
-
-				if outfd < 0 {
-					return handle_error(infd, outfd, errfd);
-				}
-			},
-			::UBEND_INHERIT => {},
-			_ if outaction > -1 => {
-				outfd = outaction;
-				child.outfd = -1;
-			},
-			_ => {
-				*__errno_location() = EINVAL;
-				return handle_error(infd, outfd, errfd);
-			}
-		}
-
-		match erraction {
-			::UBEND_PIPE => {
-				let mut pair: [c_int; 2] = [-1, -1];
-				if pipe2(pair.as_mut_ptr(), O_CLOEXEC) == -1 {
-					return handle_error(infd, outfd, errfd);
-				}
-				errfd = pair[1];
-				child.errfd = pair[0];
-			},
-			::UBEND_NULL => {
-				errfd = open(cstr!(b"/dev/null\0"), O_WRONLY);
-
-				if errfd < 0 {
-					return handle_error(infd, outfd, errfd);
-				}
-			},
-			::UBEND_TO_STDOUT => {},
-			::UBEND_TEMP => {
-				errfd = open_temp_fd();
-				child.errfd = errfd;
-
-				if errfd < 0 {
-					return handle_error(infd, outfd, errfd);
-				}
-			},
-			::UBEND_INHERIT => {},
-			_ if erraction > -1 => {
-				errfd = erraction;
-				child.errfd = -1;
-			},
-			_ => {
-				*__errno_location() = EINVAL;
-				return handle_error(infd, outfd, errfd);
-			}
-		}
-
 		let pid = fork();
 
 		if pid == -1 {
-			return handle_error(infd, outfd, errfd);
+			return Err(Error::OS(*__errno_location()));
 		}
 
 		if pid == 0 {
 			// child
-
-			// close unused ends
-			if child.infd > -1 && child.infd != infd {
-				close(child.infd);
-				child.infd = -1;
-			}
-
-			if child.outfd > -1 && child.outfd != outfd {
-				close(child.outfd);
-				child.outfd = -1;
-			}
-
-			if child.errfd > -1 && child.errfd != errfd {
-				close(child.errfd);
-				child.errfd = -1;
-			}
-
-			redirect_fd(infd, STDIN_FILENO, cstr!(b"redirecting stdin\0"));
-
-			if last == Target::Stderr {
-				redirect_out_fd(outaction, outfd, STDOUT_FILENO, cstr!(b"redirecting stdout\0"));
-				redirect_out_fd(erraction, errfd, STDERR_FILENO, cstr!(b"redirecting stderr\0"));
-			} else {
-				redirect_out_fd(erraction, errfd, STDERR_FILENO, cstr!(b"redirecting stderr\0"));
-				redirect_out_fd(outaction, outfd, STDOUT_FILENO, cstr!(b"redirecting stdout\0"));
-			}
+			redirect_fd(stdin,  STDIN_FILENO,  cstr!(b"redirecting stdin\0"));
+			redirect_fd(stdout, STDOUT_FILENO, cstr!(b"redirecting stdout\0"));
+			redirect_fd(stderr, STDERR_FILENO, cstr!(b"redirecting stderr\0"));
 
 			if envp != ptr::null() {
 				*environ() = envp;
@@ -1379,198 +1472,257 @@ fn ubend_open(argv: *const *const c_char, envp: *const *const c_char, child: &mu
 				perror(*argv);
 			}
 			exit(EXIT_FAILURE);
-		} else {
-			// parent
-			child.pid = pid;
-
-			if inaction  != UBEND_TEMP && infd  > -1 { close(infd); }
-			if outaction != UBEND_TEMP && outfd > -1 { close(outfd); }
-			if erraction != UBEND_TEMP && errfd > -1 { close(errfd); }
 		}
-
-		Ok(())
+		
+		return Ok(pid);
 	}
 }
 
+fn ubend_sigterm(children: &[Child]) {
+	for child in children {
+		unsafe { kill(child.pid, SIGTERM); }
+	}
+}
+
+/*
+unsafe fn ubend_close(fd: c_int) -> std::io::Result<()> {
+	if close(fd) != 0 {
+		let errno = *__errno_location();
+		let kind = match errno {
+			::EBADF  => std::io::ErrorKind::InvalidInput,
+			::EINTR  => std::io::ErrorKind::Interrupted,
+			::EINVAL => std::io::ErrorKind::InvalidInput,
+			_        => std::io::ErrorKind::Other
+		};
+		return Err(std::io::Error::new(kind, strerror(errno)));
+	}
+	Ok(())
+}
+*/
+
 impl Command {
+	/// Helper to create an empty command object inheriting all the streams.
 	pub fn empty() -> Self {
 		Command {
-			stdin:  PipeSetup::Inherit,
-			stdout: PipeSetup::Inherit,
-			stderr: PipeSetup::Inherit,
-			last: Target::Stderr,
+			stdin:  InternalSetup::Inherit,
+			stdout: InternalSetup::Inherit,
+			stderr: InternalSetup::Inherit,
 			argv: Vec::with_capacity(0),
 			envp: HashMap::with_capacity(0)
 		}
 	}
 
+	/// Helper to create a command object initialized with the program to
+	/// execute and inheriting all the streams.
 	pub fn new(prog: &str) -> Self {
 		Command {
-			stdin:  PipeSetup::Inherit,
-			stdout: PipeSetup::Inherit,
-			stderr: PipeSetup::Inherit,
-			last: Target::Stderr,
+			stdin:  InternalSetup::Inherit,
+			stdout: InternalSetup::Inherit,
+			stderr: InternalSetup::Inherit,
 			argv: vec![prog.to_string()],
 			envp: HashMap::new()
 		}
 	}
 
-	pub fn first(args: &[&str]) -> Self {
+	pub fn from_argv_and_envp(argv: Vec<String>, envp: HashMap<String, String>) -> Self {
 		Command {
-			stdin:  PipeSetup::Inherit,
-			stdout: PipeSetup::Pipe,
-			stderr: PipeSetup::Inherit,
-			last: Target::Stderr,
-			argv: args.iter().map(|arg| arg.to_string()).collect(),
+			stdin:  InternalSetup::Inherit,
+			stdout: InternalSetup::Inherit,
+			stderr: InternalSetup::Inherit,
+			argv,
+			envp
+		}
+	}
+
+	/// Helper to create a comand object suitable for the first in a pipe
+	/// chain.
+	///
+	/// `argv` will be initialized by the given args. `stdout` will be
+	/// initialized as a pipe, the other streams will inherit.
+	pub fn first<Str: AsRef<str>>(args: &[Str]) -> std::io::Result<Self> {
+		Ok(Command {
+			stdin:  InternalSetup::Inherit,
+			stdout: InternalSetup::pipe()?,
+			stderr: InternalSetup::Inherit,
+			argv: args.iter().map(|arg| arg.as_ref().to_string()).collect(),
+			envp: HashMap::new()
+		})
+	}
+
+	/// Helper to create a comand object suitable for the last in a pipe
+	/// chain.
+	///
+	/// `argv` will be initialized by the given args. `stdin` will be
+	/// initialized as a pipe, the other streams will inherit.
+	pub fn last<Str: AsRef<str>>(args: &[Str]) -> Self {
+		Command {
+			stdin:  InternalSetup::InPipe,
+			stdout: InternalSetup::Inherit,
+			stderr: InternalSetup::Inherit,
+			argv: args.iter().map(|arg| arg.as_ref().to_string()).collect(),
 			envp: HashMap::new()
 		}
 	}
 
-	pub fn last(args: &[&str]) -> Self {
-		Command {
-			stdin:  PipeSetup::Pipe,
-			stdout: PipeSetup::Inherit,
-			stderr: PipeSetup::Inherit,
-			last: Target::Stderr,
-			argv: args.iter().map(|arg| arg.to_string()).collect(),
+	pub fn pass_through<Str: AsRef<str>>(args: &[Str]) -> std::io::Result<Self> {
+		Ok(Command {
+			stdin:  InternalSetup::InPipe,
+			stdout: InternalSetup::pipe()?,
+			stderr: InternalSetup::Inherit,
+			argv: args.iter().map(|arg| arg.as_ref().to_string()).collect(),
 			envp: HashMap::new()
-		}
+		})
 	}
 
-	pub fn pass_through(args: &[&str]) -> Self {
-		Command {
-			stdin:  PipeSetup::Pipe,
-			stdout: PipeSetup::Pipe,
-			stderr: PipeSetup::Inherit,
-			last: Target::Stderr,
-			argv: args.iter().map(|arg| arg.to_string()).collect(),
-			envp: HashMap::new()
-		}
+	/// Set an environment variable.
+	///
+	/// The child process will inherit the environment of this process except
+	/// for the variables that are explicitly overwritten.
+	pub fn env<Str: AsRef<str>>(&mut self, key: Str, value: Str) {
+		self.envp.insert(key.as_ref().to_string(), value.as_ref().to_string());
 	}
 
-	pub fn pass_stdin(fd: c_int, args: &[&str]) -> Self {
-		Command {
-			stdin:  PipeSetup::FileDescr(fd),
-			stdout: PipeSetup::Pipe,
-			stderr: PipeSetup::Inherit,
-			last: Target::Stderr,
-			argv: args.iter().map(|arg| arg.to_string()).collect(),
-			envp: HashMap::new()
-		}
+	/// Add an argument to `argv`.
+	pub fn arg<Str: AsRef<str>>(&mut self, arg: Str) {
+		self.argv.push(arg.as_ref().to_string());
 	}
 
-	pub fn pass_stdout(fd: c_int, args: &[&str]) -> Self {
-		Command {
-			stdin:  PipeSetup::Pipe,
-			stdout: PipeSetup::FileDescr(fd),
-			stderr: PipeSetup::Inherit,
-			last: Target::Stderr,
-			argv: args.iter().map(|arg| arg.to_string()).collect(),
-			envp: HashMap::new()
-		}
-	}
-
-	pub fn pass_stderr(fd: c_int, args: &[&str]) -> Self {
-		Command {
-			stdin:  PipeSetup::Pipe,
-			stdout: PipeSetup::Inherit,
-			stderr: PipeSetup::FileDescr(fd),
-			last: Target::Stderr,
-			argv: args.iter().map(|arg| arg.to_string()).collect(),
-			envp: HashMap::new()
-		}
-	}
-
-	pub fn has_output(&self) -> bool {
-		// cases in which nothing arrives at stdout:
-		// 2>&2 1>&2
-		// 1>&2 2>&1
-		// 1>&2 2>&2
-		// 1>$FILE 2>&1
-		match self.stdout {
-			PipeSetup::Pipe => {},
-			PipeSetup::FileDescr(_) | PipeSetup::FileName(_, _) => {
-				if self.last == Target::Stderr || self.stderr.is_inherit() {
-					return false;
-				}
+	/// Setup piping of `stdin`.
+	pub fn stdin(&mut self, setup: PipeSetup) -> std::io::Result<()> {
+		self.stdin = match setup {
+			PipeSetup::Inherit => InternalSetup::Inherit,
+			PipeSetup::Pipe => InternalSetup::InPipe,
+			PipeSetup::Null => InternalSetup::null(Mode::Read)?,
+			PipeSetup::Redirect(_) => {
+				return Err(std::io::Error::new(
+					std::io::ErrorKind::InvalidInput,
+					"cannot redirect stdin to stdout/stderr"));
 			},
-			PipeSetup::Redirect(Target::Stderr) => {
-				if
-						(self.last == Target::Stderr && self.stderr.is_redirect_to(Target::Stdout)) ||
-						self.stderr.is_redirect_to(Target::Stderr) {
-					return false;
+			PipeSetup::Temp => InternalSetup::temp()?,
+			PipeSetup::FileName(name, mode) => {
+				if mode != Mode::Read {
+					return Err(std::io::Error::new(
+						std::io::ErrorKind::InvalidInput,
+						"mode must be Read"));
 				}
+				InternalSetup::open(name.as_str(), mode)?
 			},
-			_ => {}
-		}
-		return true;
+			PipeSetup::File(file) => InternalSetup::File(file.into_raw_fd()),
+		};
+		Ok(())
 	}
 
-	pub fn env(&mut self, key: &str, value: &str) {
-		self.envp.insert(key.to_string(), value.to_string());
+	/// Setup piping of `stdout`.
+	///
+	/// The order of calling `stdout()` and [stderr()](struct.Command.html#method.stderr)
+	/// is relevant when redirecting either to the other. E.g. first redirecting
+	/// stdout to stderr and then stderr to a file will write error messages to
+	/// the given file and normal output as error messages.
+	///
+	/// Doing it the other way around will cause both kinds of messages to be
+	/// written to the file.
+	pub fn stdout(&mut self, setup: PipeSetup) -> std::io::Result<()> {
+		self.stdout = match setup {
+			PipeSetup::Inherit => InternalSetup::Inherit,
+			PipeSetup::Pipe => InternalSetup::pipe()?,
+			PipeSetup::Null => InternalSetup::null(Mode::Write)?,
+			PipeSetup::Redirect(Target::Stdout) => return Ok(()),
+			PipeSetup::Redirect(Target::Stderr) => self.stderr.try_clone()?,
+			PipeSetup::Temp => InternalSetup::temp()?,
+			PipeSetup::FileName(name, mode) => {
+				if mode == Mode::Read {
+					return Err(std::io::Error::new(
+						std::io::ErrorKind::InvalidInput,
+						"mode must not be Read"));
+				}
+				InternalSetup::open(name.as_str(), mode)?
+			},
+			PipeSetup::File(file) => InternalSetup::File(file.into_raw_fd()),
+		};
+		Ok(())
 	}
 
-	pub fn arg(&mut self, arg: &str) {
-		self.argv.push(arg.to_string());
+	/// Setup piping of `stderr`.
+	///
+	/// The order of calling [stdout()](struct.Command.html#method.stdout) and
+	/// `stderr()` is relevant when redirecting either to the other. E.g. first
+	/// redirecting stdout to stderr and then stderr to a file will write error
+	/// messages to the given file and normal output as error messages.
+	///
+	/// Doing it the other way around will cause both kinds of messages to be
+	/// written to the file.
+	pub fn stderr(&mut self, setup: PipeSetup) -> std::io::Result<()> {
+		self.stderr = match setup {
+			PipeSetup::Inherit => InternalSetup::Inherit,
+			PipeSetup::Pipe => InternalSetup::pipe()?,
+			PipeSetup::Null => InternalSetup::null(Mode::Write)?,
+			PipeSetup::Redirect(Target::Stdout) => self.stdout.try_clone()?,
+			PipeSetup::Redirect(Target::Stderr) => return Ok(()),
+			PipeSetup::Temp => InternalSetup::temp()?,
+			PipeSetup::FileName(name, mode) => {
+				if mode == Mode::Read {
+					return Err(std::io::Error::new(
+						std::io::ErrorKind::InvalidInput,
+						"mode must not be Read"));
+				}
+				InternalSetup::open(name.as_str(), mode)?
+			},
+			PipeSetup::File(file) => InternalSetup::File(file.into_raw_fd()),
+		};
+		Ok(())
 	}
 
-	pub fn stdin(&mut self, setup: PipeSetup) {
-		match setup {
-			PipeSetup::Redirect(_) => {},
-			_ => {
-				self.stdin = setup;
-			}
-		}
-	}
-
-	pub fn stdout(&mut self, setup: PipeSetup) {
-		self.stdout = setup;
-		self.last = Target::Stdout;
-	}
-
-	pub fn stderr(&mut self, setup: PipeSetup) {
-		self.stderr = setup;
-		self.last = Target::Stderr;
-	}
-
-	pub fn open(self) -> Result<Child> {
+	/// Start a child process.
+	pub fn spawn(self) -> Result<Child> {
 		if self.argv.is_empty() {
 			return Err(Error::NotEnoughArguments);
 		}
 
-		match self.stdin {
-			PipeSetup::Redirect(target) => {
-				return Err(Error::CannotRedirectStdinTo(target));
-			},
-			_ => {}
-		}
+		let (parent_in,  child_in)  = self.stdin.as_fd_pair(STDIN_FILENO);
+		let (parent_out, child_out) = self.stdout.as_fd_pair(STDOUT_FILENO);
+		let (parent_err, child_err) = self.stderr.as_fd_pair(STDERR_FILENO);
 
-		let mut child = unsafe { Child {
+		let mut child = Child {
 			pid: -1,
-			infd:  self.stdin.into_raw_fd(),
-			outfd: self.stdout.into_raw_fd(),
-			errfd: self.stderr.into_raw_fd()
-		}};
-
-		if child.outfd == UBEND_TO_STDOUT {
-			child.outfd = UBEND_PIPE;
-		}
-
-		if child.errfd == UBEND_TO_STDERR {
-			child.errfd = UBEND_PIPE;
-		}
+			infd:  parent_in,
+			outfd: parent_out,
+			errfd: parent_err
+		};
 
 		let (argvbuf, argv) = make_argv(&self.argv);
 		let (envpbuf, envp) = make_envp(&self.envp);
 
-		ubend_open((&argv).as_ptr(), (&envp).as_ptr(), &mut child, self.last)?;
+		let res = ubend_spawn((&argv).as_ptr(), (&envp).as_ptr(), child_in, child_out, child_err);
 
 		// I hope these explicit drops ensure the lifetime of the buffers
 		// until this point, even with non-lexical lifetimes.
 		drop(argvbuf);
 		drop(envpbuf);
 
+		match res {
+			Ok(pid) => {
+				child.pid = pid;
+				self.drop_as_parent();
+			},
+			Err(err) => {
+				return Err(err);
+			}
+		}
+
 		Ok(child)
+	}
+
+	fn drop_as_parent(self) {
+		self.stdin.drop_as_parent();
+		self.stdout.drop_as_parent();
+		self.stderr.drop_as_parent();
+	}
+
+	#[allow(dead_code)]
+	fn drop_as_child(self) {
+		self.stdin.drop_as_child();
+		self.stdout.drop_as_child();
+		self.stderr.drop_as_child();
 	}
 }
 
@@ -1639,74 +1791,37 @@ impl Chain {
 		Ok(())
 	}
 
-	/// Create a new pipe chain. This function is called by the
-	/// [ubend!()](macro.ubend.html) macro.
-	pub fn new(pipes: Vec<Command>) -> Result<Self> {
-		let len = pipes.len();
+	/// Create a new pipe chain, spawning child processes.
+	///
+	/// This function is called by the [ubend!()](macro.ubend.html) macro.
+	pub fn new(commands: Vec<Command>) -> Result<Self> {
+		let len = commands.len();
 		if len == 0 {
 			return Err(Error::NotEnoughPipes);
 		}
 
-		for pipe in &pipes {
-			if pipe.argv.is_empty() {
+		for command in &commands {
+			if command.argv.is_empty() {
 				return Err(Error::NotEnoughArguments);
-			}
-
-			match pipe.stdin {
-				PipeSetup::Redirect(target) => {
-					return Err(Error::CannotRedirectStdinTo(target));
-				},
-				_ => {}
 			}
 		}
 
 		let mut children = Vec::<Child>::with_capacity(len);
 		let mut index = 0;
-		for pipe in pipes {
-			let mut child = unsafe { Child {
-				pid: -1,
-				infd:  pipe.stdin.into_raw_fd(),
-				outfd: pipe.stdout.into_raw_fd(),
-				errfd: pipe.stderr.into_raw_fd()
-			}};
-
-			if child.outfd == UBEND_TO_STDOUT {
-				child.outfd = UBEND_PIPE;
+		for mut command in commands {
+			if index > 0 && command.stdin.is_in_pipe() {
+				let mut prev = &mut children[index - 1];
+				command.stdin = InternalSetup::File(prev.outfd);
+				prev.outfd = -1;
 			}
 
-			if child.errfd == UBEND_TO_STDERR {
-				child.errfd = UBEND_PIPE;
-			}
-
-			if index > 0 && child.infd == UBEND_PIPE {
-				let prevfd = children[index - 1].outfd;
-				if prevfd > -1 {
-					child.infd = prevfd;
-					children[index - 1].outfd = -1;
-				}
-				// Otherwise chain.stdin_at(index) has to be called by the API
-				// user in order to provide that particular stream with data.
-			}
-
-			let (argvbuf, argv) = make_argv(&pipe.argv);
-			let (envpbuf, envp) = make_envp(&pipe.envp);
-
-			let res = ubend_open((&argv).as_ptr(), (&envp).as_ptr(), &mut child, pipe.last);
-
-			// I hope these explicit drops ensure the lifetime of the buffers
-			// until this point, even with non-lexical lifetimes.
-			drop(argvbuf);
-			drop(envpbuf);
-
-			match res {
+			let mut child = match command.spawn() {
+				Ok(child) => child,
 				Err(err) => {
-					for mut child in &mut children {
-						unsafe { kill(child.pid, SIGTERM); }
-					}
+					ubend_sigterm(&children);
 					return Err(err);
 				}
-				_ => {}
-			}
+			};
 
 			children.push(child);
 			index += 1;
@@ -1774,10 +1889,18 @@ impl Chain {
 		None
 	}
 
+	/// The a list of child processes.
+	///
+	/// This is returned as a slice so that no child can be added/removed,
+	/// which is an invariant required by other methods.
 	pub fn children(&self) -> &[Child] {
 		&self.children
 	}
 
+	/// The a mutable list of child processes.
+	///
+	/// This is returned as a slice so that no child can be added/removed,
+	/// which is an invariant required by other methods.
 	pub fn children_mut(&mut self) -> &mut [Child] {
 		&mut self.children
 	}

@@ -235,3 +235,26 @@ fn spread_args() {
 
 	assert_output!(ubend!(echo "egg" ["foo", "bar", "baz"]... "bacon"), "egg foo bar baz bacon\n");
 }
+
+#[test]
+fn multi_redirect() {
+	remove_output_file("./tests/multi_redirect.txt");
+
+	let out = ubend!("./tests/stdio.sh" 2>Pipe 1>&2 2>"./tests/multi_redirect.txt").
+	expect("spawn").output().expect("read");
+	println!("status: {}", out.status);
+	println!("stdout: {}", String::from_utf8(out.stdout).expect("UTF-8"));
+	println!("stderr: {}", String::from_utf8(out.stderr).expect("UTF-8"));
+/*
+	assert_output!(
+		ubend!("./tests/stdio.sh" 1>&2 2>"./tests/multi_redirect.txt"),
+		"", "stdout\n");
+	assert_file_contens!("./test/multi_redirect.txt", "stderr\n");
+
+	remove_output_file("./tests/multi_redirect.txt");
+	assert_output!(
+		ubend!("./tests/stdio.sh" 2>"./tests/multi_redirect.txt" 1>&2),
+		"", "");
+	assert_file_contens!("./test/multi_redirect.txt", "stdout\nstderr\n");
+*/
+}
